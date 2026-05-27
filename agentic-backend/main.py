@@ -1,0 +1,36 @@
+"""FastAPI entry point for the Dual-MCP Agent Backend.
+
+Receives Google Chat webhooks, verifies the inbound JWT, and forwards
+the payload to the chat event handler.
+"""
+
+import os
+
+# google-genai inspects these on import, so they must be set before any
+# downstream module pulls google.genai into the import graph.
+os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "1"
+os.environ.setdefault("LOCATION", "us-central1")
+
+from dotenv import load_dotenv  # noqa: E402 — load env vars before our imports
+
+load_dotenv()
+
+from fastapi import Depends, FastAPI, Request  # noqa: E402
+
+from chat import handle_event  # noqa: E402
+from security import verify_chat_jwt  # noqa: E402
+
+app = FastAPI(title="Dual-MCP Agent Backend")
+
+
+@app.post("/")
+async def chat_webhook(
+    request: Request,
+    _claims: dict = Depends(verify_chat_jwt),
+) -> dict[str, str]:
+    """Entry point for Google Chat webhooks.
+
+    ``verify_chat_jwt`` runs first via FastAPI's dependency injection;
+    the request body is only parsed after the token has been verified.
+    """
+    return await handle_event(await request.json())

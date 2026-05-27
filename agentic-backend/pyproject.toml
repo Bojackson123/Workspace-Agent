@@ -1,0 +1,14 @@
+[project]
+name = "agentic-backend"
+version = "0.1.0"
+description = "Dual-MCP Agent Backend — Google Chat webhook handler using Google ADK"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "google-auth>=2.38.0",
+    "google-adk>=1.0.0",
+    "mcp>=1.1.2",
+    "python-dotenv>=1.1.0",
+]

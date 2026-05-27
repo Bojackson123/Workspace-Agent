@@ -1,0 +1,14 @@
+[project]
+name = "action-mcp"
+version = "0.1.0"
+description = "Action MCP Server — Read/Write Shared Drive operations via ADC"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.9.0",
+    "google-api-python-client>=2.170.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth>=2.38.0",
+    "python-dotenv>=1.1.0",
+    "uvicorn[standard]>=0.34.0",
+]
