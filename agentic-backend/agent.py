@@ -1,63 +1,47 @@
-"""Workspace Assistant agent definition and per-request factory.
+"""LLM-agent building blocks for the workflow package.
 
-The agent is wired to two MCP toolsets:
+This module exposes the low-level factories every workflow can reuse:
 
-* **Context MCP** — read-only access to the user's personal data. The
-  user's identity is carried as an ``X-User-Email`` header on the MCP
-  transport so the server can impersonate the user via Domain-Wide
-  Delegation. No user identifier appears in tool arguments.
+* :func:`context_toolset` — MCPToolset wired to Context MCP for a
+  specific user (their email is sent as a header, never as a tool
+  argument).
+* :func:`action_toolset` — MCPToolset wired to Action MCP (no user
+  identity; the MCP authenticates as its own service account).
+* :func:`build_llm_agent` — stock ``LlmAgent`` constructor using this
+  app's model + description.
 
-* **Action MCP** — read/write access to a designated Shared Drive,
-  authenticated with the service account's own ADC credentials.
+Workflow files import these directly to assemble whatever ADK shape
+they need (single ``LlmAgent``, ``SequentialAgent``, ``LoopAgent``,
+custom ``BaseAgent`` subclass). The dispatcher then calls
+:func:`build_agent_for_workflow`, which simply delegates to the
+workflow's own ``build_agent`` factory.
 
-A module-level ``root_agent`` exists for the ADK CLI (``adk run`` /
-``adk web``); live MCP connections are built fresh per request inside
-``build_agent_for_user``.
+We import only from :mod:`workflows._base` for type symbols — never
+from :mod:`workflows` — so the helper layer in
+:mod:`workflows._helpers` can depend on this module without creating
+a cycle.
 """
 
-from google.adk.agents import LlmAgent
+from __future__ import annotations
+
+from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.tools.mcp_tool import MCPToolset, StreamableHTTPConnectionParams
 
 from config import settings
+from workflows._base import Workflow
 
 AGENT_DESCRIPTION = (
     "A Google Workspace assistant that reads user context via a "
     "read-only Context MCP and writes outputs via an Action MCP."
 )
 
-AGENT_INSTRUCTION = """\
-You are an enterprise Google Workspace assistant.
 
-You have access to two groups of tools — Context tools and Action tools.
-
-**Context tools** search and retrieve the user's personal data (emails,
-documents, chat history). The server behind these tools securely extracts
-the user's identity from the network transport, so you do NOT need to pass
-any user identifier.
-
-**Action tools** create, modify, and manage Docs, Sheets, and other files
-on a designated Shared Drive. The server uses its own service-account
-identity.
-
-Rules:
-1. Use Context tools only to *read* personal data for grounding your
-   answers. Never attempt to write or modify personal data.
-2. Use Action tools to produce any outputs (documents, spreadsheets,
-   files). All outputs MUST target the designated Shared Drive.
-3. Do NOT use Action tools to manipulate data found via Context tools
-   directly. Summarise, transform, or reference it instead.
-4. Before modifying any existing file on the Shared Drive, always query
-   the Action tool ``search_drive`` to obtain the exact file/folder ID
-   first.
-"""
-
-
-def _context_toolset(user_email: str) -> MCPToolset:
+def context_toolset(user_email: str) -> MCPToolset:
     """Build the Context MCP toolset bound to *user_email*.
 
     The email is sent as a header (not a tool argument) so that the LLM
-    is structurally incapable of impersonating another user — even under
-    prompt injection.
+    is structurally incapable of impersonating another user — even
+    under prompt injection.
     """
     return MCPToolset(
         connection_params=StreamableHTTPConnectionParams(
@@ -67,11 +51,12 @@ def _context_toolset(user_email: str) -> MCPToolset:
     )
 
 
-def _action_toolset() -> MCPToolset:
+def action_toolset() -> MCPToolset:
     """Build the Action MCP toolset.
 
-    No user identifier is sent: the Action MCP authenticates as a single
-    service account and writes only to the designated Shared Drive.
+    No user identifier is sent: the Action MCP authenticates as a
+    single service account and writes only to the designated Shared
+    Drive.
     """
     return MCPToolset(
         connection_params=StreamableHTTPConnectionParams(
@@ -80,34 +65,39 @@ def _action_toolset() -> MCPToolset:
     )
 
 
-def _build_agent(toolsets: list[MCPToolset] | None = None) -> LlmAgent:
-    """Construct an ``LlmAgent`` with the standard description, model, and prompt."""
+def build_llm_agent(
+    *,
+    instruction: str,
+    tools: list[MCPToolset] | None = None,
+) -> LlmAgent:
+    """Construct an ``LlmAgent`` with the app-standard model + description."""
     cfg = settings()
     return LlmAgent(
         name=cfg.agent_name,
         model=cfg.agent_model,
         description=AGENT_DESCRIPTION,
-        instruction=AGENT_INSTRUCTION,
-        tools=toolsets or [],
+        instruction=instruction,
+        tools=tools or [],
     )
 
 
-# Discovered by the ADK CLI. Toolsets are deliberately empty because the
-# CLI cannot supply a user email; live tools are wired in per request.
-root_agent = _build_agent()
+# Discovered by the ADK CLI (``adk run`` / ``adk web``). Toolsets are
+# empty here because the CLI cannot supply a user email or invoke a
+# workflow's async factory; live tools are wired in per request.
+root_agent = build_llm_agent(
+    instruction="(placeholder — live tools are wired per-request)",
+)
 
 
-async def build_agent_for_user(user_email: str) -> LlmAgent:
-    """Construct an agent with fresh MCP connections for one inbound request.
+async def build_agent_for_workflow(
+    workflow: Workflow, user_email: str
+) -> BaseAgent:
+    """Ask *workflow* for the ADK agent to run this request against.
 
-    A fresh build per request avoids two failure modes:
-
-    * Stale ADC tokens cached inside long-lived MCP transports.
-    * Half-open streamable-HTTP sessions left over from a prior request.
+    The dispatcher does not care which ADK agent type comes back —
+    ``LlmAgent``, ``SequentialAgent``, ``LoopAgent``, or any other
+    ``BaseAgent`` subclass. A fresh build per request keeps MCP
+    transports short-lived (avoiding stale ADC tokens and half-open
+    streamable-HTTP sessions).
     """
-    return _build_agent(
-        toolsets=[
-            _context_toolset(user_email),
-            _action_toolset(),
-        ]
-    )
+    return await workflow.build_agent(user_email)

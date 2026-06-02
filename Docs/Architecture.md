@@ -25,32 +25,45 @@ token — it only emits tool calls.
 ```
                   ┌────────────────────┐
    Human user ───►│   Google Chat app  │
+                  │ /research /draft   │
+                  │ /report /help ...  │
                   └─────────┬──────────┘
                             │ HTTPS POST + OIDC bearer
                             │ (chat@system.gserviceaccount.com)
                             ▼
-                  ┌────────────────────┐
-                  │  Agent Backend     │  Cloud Run, public ingress
-                  │  (FastAPI + ADK)   │  Service account: backend-sa
-                  └──┬──────────────┬──┘
-                     │              │
-                     │              │
-        X-User-Email │              │ (no user identity)
-        header       │              │
-                     ▼              ▼
-       ┌─────────────────┐   ┌─────────────────┐
-       │ Context MCP     │   │ Action MCP      │   Cloud Run
-       │ Read-only,      │   │ Read/Write,     │
-       │ DWD impersonate │   │ acts as itself  │
-       │ context-mcp-sa  │   │ action-mcp-sa   │
-       └────────┬────────┘   └────────┬────────┘
-                │                     │
-                ▼                     ▼
-       ┌─────────────────┐   ┌─────────────────┐
-       │ User's personal │   │  Shared Drive   │
-       │ Gmail / Drive / │   │  (action-mcp-sa │
-       │ Docs / Chat     │   │   is a member)  │
-       └─────────────────┘   └─────────────────┘
+        ┌───────────────────────────────────────────┐
+        │            Agent Backend                  │  Cloud Run
+        │            (FastAPI + ADK)                │  backend-sa
+        │                                           │
+        │  security.py     → verify Chat JWT        │
+        │  chat.py         → parse slashCommand,    │
+        │                    thread, prompt;        │
+        │                    /grant /revoke /help   │
+        │  workflows.py    → resolve command_id     │
+        │  access.py       → authorize              │
+        │  access_store.py ←┐ (rules table)         │
+        │  sessions.py    ←─┤ Postgres              │
+        │                   └─► Cloud SQL           │
+        │                      (sessions + ACL)     │
+        │  agent.py        → build workflow-scoped  │
+        │                    LlmAgent               │
+        └──┬──────────────────────────────────┬─────┘
+           │                                  │
+           │ X-User-Email                     │ (no user identity)
+           ▼                                  ▼
+   ┌─────────────────┐                 ┌─────────────────┐
+   │ Context MCP     │                 │ Action MCP      │   Cloud Run
+   │ Read-only,      │                 │ Read/Write,     │
+   │ DWD impersonate │                 │ acts as itself  │
+   │ context-mcp-sa  │                 │ action-mcp-sa   │
+   └────────┬────────┘                 └────────┬────────┘
+            │                                   │
+            ▼                                   ▼
+   ┌─────────────────┐                 ┌─────────────────┐
+   │ User's personal │                 │  Shared Drive   │
+   │ Gmail / Drive / │                 │  (action-mcp-sa │
+   │ Docs / Chat     │                 │   is a member)  │
+   └─────────────────┘                 └─────────────────┘
 ```
 
 ### Request flow
@@ -61,21 +74,62 @@ token — it only emits tool calls.
    token signature, the `aud` claim, and that `email ==
    chat@system.gserviceaccount.com`. The body is *not* parsed before
    this check passes.
-3. **Identity extraction.** `agentic-backend/chat.py` reads
-   `body.user.email` from the verified payload.
-4. **Agent build.** `agentic-backend/agent.py:build_agent_for_user`
-   constructs a fresh `LlmAgent` per request with two MCP toolsets:
+3. **Identity + payload extraction.** `agentic-backend/chat.py` reads
+   `body.user.email`, the slash command (`message.slashCommand.commandId`,
+   if any), the conversation thread (`message.thread.name`), and the
+   prompt text (with the slash-command prefix stripped via the
+   `SLASH_COMMAND` annotation).
+4. **Workflow dispatch.** The `workflows/` package resolves the
+   command ID to a `Workflow` entry. Reserved commands (`/exit`,
+   `/help`, plus admin `/grant`, `/revoke`, `/list-access`) are
+   handled inline and skip the LLM entirely.
+5. **Authorization.** `access.py` asks `access_store.py` for the
+   compiled `AccessPolicy` for this `command_id` (cached per process
+   for `ACCESS_CACHE_TTL_SECONDS`). If the rules table is empty for
+   the command, the workflow's `default_access` (`OPEN` / `RESTRICTED`)
+   decides; otherwise the email / domain / group rules are evaluated.
+   Denials produce an audit-logged warning and a user-facing
+   rejection.
+6. **Session resolve.** `sessions.py` looks up an ADK session keyed by
+   `(user_email, sha256(thread.name))` in the `DatabaseSessionService`.
+   A new slash command always starts a fresh session; a free-form
+   continuation reuses the existing one (if within the inactivity TTL)
+   and inherits its active workflow.
+7. **Agent build.** `agentic-backend/agent.py:build_agent_for_workflow`
+   constructs a fresh `LlmAgent` per request with the workflow's system
+   instruction and only the MCP toolsets that workflow declares:
     - **Context toolset** — `X-User-Email: <user>` header attached at
       the transport layer.
     - **Action toolset** — no user identity attached at all.
-5. **Tool calls.**
+8. **Tool calls.**
     - Context MCP middleware reads the header into a contextvar; each
       tool mints DWD credentials for that user and calls the Workspace
       API as them.
     - Action MCP authenticates with ADC (its own runtime SA) and writes
       to the Shared Drive.
-6. **Reply.** The final ADK response text is wrapped in
-   `{"text": "..."}` and returned to Chat.
+9. **Ack + async reply.** Google Chat shows a *"… is not responding"*
+   banner after roughly six seconds and hard-times-out the webhook
+   around thirty. Multi-tool agent runs blow past both, so the
+   dispatcher splits the response in two:
+    - **Synchronous ack** — the webhook immediately returns either the
+      workflow's `ack_message` (a short "On it…" line set per workflow
+      in `workflows/`) or an empty `{}` envelope when none is
+      configured. Plain follow-ups inside an active session always
+      return empty so the thread doesn't fill with "working on it"
+      noise.
+    - **Background run** — the agent run is enqueued onto FastAPI's
+      per-request `BackgroundTasks`. When the agent finishes, its
+      final text is converted from standard Markdown into Chat's
+      flavour (single-asterisk bold, `•` bullets, `<url|text>` links)
+      and posted back into the same `space.name` + `thread.name` via
+      `chat.spaces.messages.create` using `chat_client.py`.
+      Reserved commands (`/help`, `/exit`, `/grant`, …) never use the
+      background path — their responses are instant and return
+      synchronously.
+
+   ADK persists the conversation turn to the session DB during the
+   background run, so the next message in the same thread can resume
+   the workflow regardless of which path produced the reply.
 
 ### Why the email lives in a header, not a tool argument
 
@@ -85,6 +139,163 @@ through a tool argument, the Context MCP would ignore it — the
 backend after JWT verification. Prompt injection cannot escalate
 identity, because identity is structurally absent from the LLM's I/O
 surface.
+
+### Workflow engine
+
+A single Chat app exposes multiple slash commands, each driving a
+different workflow. The dispatcher itself is tiny — it looks up a
+`Workflow` by `command_id`, asks it to build an ADK agent for the
+inbound request, and runs whatever comes back. **What kind of ADK
+agent comes back is the workflow's choice**: a single `LlmAgent`, a
+`SequentialAgent` chaining stages, a `LoopAgent`, a custom `BaseAgent`
+subclass — anything the SDK supports.
+
+**Registry — `workflows/` package.** One module per command. Each
+non-underscore module exposes a `WORKFLOW: Workflow` constant; the
+package `__init__.py` imports them explicitly and assembles a
+`dict[int, Workflow]` keyed by `command_id`.
+
+The `Workflow` dataclass (`workflows/_base.py`) carries:
+
+- `command_id` / `command_name` / `description` — metadata.
+- `default_access` — an `AccessMode`. Decides what happens when the
+  rules table has no rows for this command (`OPEN` allows anyone,
+  `RESTRICTED` allows nobody — see "Access control" below).
+- `build_agent(user_email) -> BaseAgent` — an async factory the
+  dispatcher calls per request. The dispatcher does not care which
+  ADK agent type comes back; a fresh build per request keeps MCP
+  transports short-lived.
+
+**Common shape via `llm_workflow(...)`.** Single-`LlmAgent` workflows
+(the original `/research` and `/draft`) use `workflows/_helpers.py`'s
+`llm_workflow(...)` factory — a one-line builder taking
+`instruction`, `toolsets` (a `frozenset[ToolsetKind]` choosing
+`CONTEXT`, `ACTION`, or both), and `default_access`. Workflows scoped
+to one toolset are *structurally* incapable of using the other; the
+unused MCP is not attached to the agent.
+
+**Richer shapes via direct ADK construction.** Workflows like
+`/report` (`workflows/sequential_report.py`) skip the helper and
+build their agent directly using the public factories on `agent.py`
+(`context_toolset`, `action_toolset`, `build_llm_agent`) plus
+`google.adk.agents.SequentialAgent`. Splitting a workflow into stages
+with disjoint toolsets is the multi-agent analogue of the dual-MCP
+boundary — a research sub-agent given only the Context toolset
+structurally cannot write to the Shared Drive, and a drafting
+sub-agent given only the Action toolset structurally cannot read
+personal data.
+
+**Adding or disabling workflows.** New file under `workflows/`, plus
+one import line in `__init__.py`. To temporarily disable, comment
+the entry out of `_REGISTERED` in `__init__.py` — the module still
+imports (so its prompt stays editable) but the dispatcher reports it
+as unknown.
+
+**The two halves must stay in lockstep.** A `command_id` registered in
+the Cloud console but missing from `WORKFLOWS` yields an "Unknown
+slash command" reply; a `command_id` in `WORKFLOWS` but missing from
+the Cloud console will never reach the backend (the UI never offers
+it). Adding a command is a two-step change.
+
+**Slash command UI visibility.** Google Chat does not support
+per-user-per-command autocomplete filtering. Every command registered
+on the Chat app appears in autocomplete for every user who can see the
+app. Access control therefore lives entirely in the backend
+(`access.py`) — denied invocations return an informative rejection
+("`/audit` is restricted to members of …; contact your admin"), and
+each denial writes a structured `WARNING` to Cloud Logging.
+
+**Reserved commands.** Five command IDs are handled directly by the
+dispatcher and do not invoke the LLM:
+
+| ID  | Command         | Purpose                                              |
+| --- | --------------- | ---------------------------------------------------- |
+| 999 | `/exit`         | Clear the active session for this thread.            |
+| 998 | `/help`         | List commands the caller has access to.              |
+| 997 | `/grant`        | Add an access rule (admins only).                    |
+| 996 | `/revoke`       | Remove an access rule (admins only).                 |
+| 995 | `/list-access`  | Show rules for a command (admins only).              |
+
+All five must be registered in the Cloud console so users can invoke
+them, but none of them get `WORKFLOWS` entries — they're handled in
+code. The three admin commands are governed by env vars
+(`BOOTSTRAP_ADMIN_EMAILS`, `BOOTSTRAP_ADMIN_GROUP`), **not** by the
+rules table they manage — losing the table cannot lock admins out,
+and a corrupted rule row cannot escalate by editing an admin
+command's own ACL.
+
+**Multi-turn sessions.** Chat marks `message.slashCommand` only on the
+first message of an invocation; follow-ups in the same thread are
+plain `MESSAGE` events. To support continuations, `sessions.py` keys
+ADK sessions by `(user_email, sha256(thread.name))` and stores the
+active workflow's `command_id` in `Session.state`. Semantics:
+
+| Inbound event | Behaviour |
+| --- | --- |
+| New slash command in thread | Delete any existing session for the thread, create a fresh one scoped to the new workflow. Conversation history does not leak between workflows. |
+| Free-form message with active session | Reuse the session, run the workflow whose `command_id` it stores. |
+| Free-form message, no active session | Run `DEFAULT_WORKFLOW` (the dual-MCP catch-all). |
+| Idle > `SESSION_TTL_SECONDS` (default 30 min) | Session is expired on next read, then deleted. Next message falls back to default. |
+| `/exit` | Session deleted. |
+
+**Access control.** Workflow *definitions* live in code; *who may
+invoke them* lives in the database. Specifically:
+
+- `workflows/_base.py` declares each workflow's `default_access` —
+  `OPEN` or `RESTRICTED` — for what to do when no rules exist.
+- `workflow_access_rules` (Postgres / SQLite) holds the actual grant
+  rows: one principal per row. Two rule kinds, OR-evaluated:
+    - `email` — explicit per-user allowlist
+    - `domain` — domain-suffix match (e.g. internal users only)
+
+Workspace group rules are deliberately not supported. Group
+membership lives in Workspace (not GCP IAM) and querying it requires
+a Workspace-authorized credential — DWD impersonating an admin, or a
+Cloud Identity IAM role on a dedicated SA. Neither is free
+operationally, and email/domain rules cover most real ACL needs. If
+this ever needs to change, the schema (`rule_type TEXT`) is forward-
+compatible: adding a `group` rule kind is purely a code change.
+
+The decision matrix:
+
+| `default_access` | rules in table | outcome             |
+| ---------------- | -------------- | ------------------- |
+| `OPEN`           | none           | allow               |
+| `OPEN`           | one or more    | evaluate rules      |
+| `RESTRICTED`     | none           | deny                |
+| `RESTRICTED`     | one or more    | evaluate rules      |
+
+DB rules are always authoritative when present; `default_access` only
+chooses the empty-table behaviour. Compiled `AccessPolicy` objects
+are cached per process for `ACCESS_CACHE_TTL_SECONDS` (default 60s);
+a grant on one Cloud Run instance becomes visible on peers within
+that window.
+
+**Managing rules at runtime.** The `/grant`, `/revoke`, and
+`/list-access` reserved commands are how operators edit the rules
+table without a deploy:
+
+```
+/grant <command-name-or-id> email:<addr>
+/grant <command-name-or-id> domain:<domain>
+/revoke <command-name-or-id> <type>:<principal>
+/list-access <command-name-or-id>
+```
+
+Examples: `/grant /audit email:alice@example.com`,
+`/grant 2 domain:example.com`,
+`/revoke /audit domain:example.com`.
+
+The handler parses the body in code; it is never routed through the
+LLM. Each accepted change writes a structured log line
+(`GRANT command=… rule=…:… by=…`) for audit. Refusing to grant
+against a reserved command name (e.g. `/grant /grant …`) returns an
+explicit message — defense in depth against admins editing the very
+commands that gate them.
+
+For the cases the chat path can't handle (DB corruption, lost
+bootstrap-admin access, automated provisioning), `manage_access.py`
+exposes the same `grant` / `revoke` / `list` operations as a CLI.
 
 ---
 
@@ -99,9 +310,15 @@ per-request.
 | --- | --- |
 | `main.py` | FastAPI app. Sets `GOOGLE_GENAI_USE_VERTEXAI=1` and `LOCATION` *before* importing google-genai, loads `.env`, mounts `verify_chat_jwt` as a dependency. |
 | `security.py` | `verify_chat_jwt` — validates the Google Chat OIDC token via `google.oauth2.id_token.verify_oauth2_token`, checks audience matches `CHAT_APP_AUDIENCE`, and rejects unless `claims.email == chat@system.gserviceaccount.com`. |
-| `chat.py` | `handle_event` / `_handle_message` / `_run_agent`. Parses Chat payloads, builds a per-request ADK `Runner` over an `InMemorySessionService`, streams the final response. |
-| `agent.py` | `build_agent_for_user(user_email)` — constructs an `LlmAgent` (`gemini-2.5-flash`) with two `MCPToolset`s. Module-level `root_agent` exists for the ADK CLI but has no toolsets attached (the CLI cannot supply an email). |
-| `config.py` | Memoised `Settings`: `context_mcp_url`, `action_mcp_url`, `chat_audience`, `location`. |
+| `chat.py` | `ChatEvent.from_payload` + `handle_event` / `_handle_message`. Parses Chat payloads (incl. `slashCommand.commandId`, `thread.name`, `space.name`, `SLASH_COMMAND` annotation), dispatches reserved commands inline (`/exit`, `/help`, plus the admin commands `/grant`, `/revoke`, `/list-access`), authorizes against the table-backed `AccessPolicy` combined with the workflow's `default_access`, resolves a persistent session via `SessionStore`, and **enqueues the agent run onto `BackgroundTasks`** instead of awaiting it inline — the sync return is just an ack so the webhook stays inside Chat's "not responding" window. `_markdown_to_chat()` translates standard Markdown into Chat's flavour before the reply is posted. Admin command bodies are parsed in code — never routed through the LLM — so prompt injection cannot reach the ACL writes. |
+| `chat_client.py` | Outbound REST client for Chat. `post_message_to_space(space_name, text, thread_name=...)` mints ADC credentials with the `chat.bot` scope and POSTs to `spaces.messages.create`, threading replies into the same conversation. Called only from the background-task path; failures are logged and swallowed since no synchronous response exists to attach an error to. |
+| `workflows/` | Package, one module per command. `_base.py` defines the `Workflow` dataclass (with an async `build_agent` factory and an optional `ack_message` shown immediately on slash-command invocation), `AccessMode`/`ToolsetKind` enums, reserved-command IDs, `ADMIN_COMMAND_IDS`, `RESERVED_COMMAND_NAMES`. `_helpers.py` exposes `llm_workflow(...)` for the single-LlmAgent shorthand. `_default.py` holds `DEFAULT_WORKFLOW` (the free-form fallback). Each non-underscore module (`research.py`, `draft.py`, `sequential_report.py`, …) exports a `WORKFLOW` constant; `__init__.py` imports them explicitly into the `WORKFLOWS` dispatch dict and re-exports the public names. |
+| `access.py` | `AccessPolicy` dataclass + `authorize(user_email, command_id, default_mode, store)` — consults the store, applies `default_mode` on empty results, evaluates email and domain rules. `authorize_bootstrap_admin(user_email)` checks `BOOTSTRAP_ADMIN_EMAILS` for the admin slash commands. |
+| `access_store.py` | `AccessStore` and `WorkflowAccessRule` (SQLAlchemy). `load(command_id)` compiles rule rows into an `AccessPolicy` with per-process TTL caching; `grant` / `revoke` / `list_rules` for the admin slash commands. Shares the SQLAlchemy engine with the session service so the backend has one Cloud SQL pool per process. |
+| `manage_access.py` | Break-glass CLI mirroring the admin slash commands. Useful when bootstrap admins are misconfigured or for automated provisioning. |
+| `sessions.py` | `SessionStore` wrapping ADK's `DatabaseSessionService`. `resolve(user_email, thread_name, new_workflow_id)` enforces the new-command-resets-session and TTL-expiry semantics; `clear()` implements `/exit`. |
+| `agent.py` | Public building blocks workflow files reuse: `context_toolset(user_email)`, `action_toolset()`, `build_llm_agent(instruction, tools)`. `build_agent_for_workflow(workflow, user_email)` delegates to `workflow.build_agent(user_email)` — the dispatcher does not need to know whether the workflow returns one `LlmAgent` or a multi-step `SequentialAgent`. Module-level `root_agent` exists for the ADK CLI but has no toolsets attached. Imports from `workflows._base` only (not the package) to keep `workflows._helpers` → `agent` acyclic. |
+| `config.py` | Memoised `Settings`: MCP URLs, `chat_audience`, `location`, `session_db_url`, `session_ttl_seconds`, `bootstrap_admin_emails` (governing admin slash commands), and `access_cache_ttl_seconds` for the compiled-policy cache. |
 | `Dockerfile` | Two-stage `uv` build → distroless-ish `python:3.12-slim`, non-root user, `uvicorn main:app --workers 1` on port 8080. |
 
 **Why a fresh agent per request.** Long-lived MCP transports can cache
@@ -120,6 +337,24 @@ toolsets) per webhook event sidesteps both failure modes.
 - `LOCATION` — Vertex AI region (default `us-central1`).
 - `GOOGLE_CLOUD_PROJECT` — Vertex AI project (picked up by
   google-genai).
+- `SESSION_DB_URL` — SQLAlchemy URL for ADK's
+  `DatabaseSessionService`. Defaults to `sqlite+aiosqlite:///./sessions.db`
+  (single-instance, ephemeral). **Set this in production** to a
+  Cloud SQL Postgres URL (e.g. `postgresql+asyncpg://…`).
+- `SESSION_TTL_SECONDS` — inactivity timeout before a Chat-thread
+  session is dropped and the next message falls back to the default
+  agent (default `1800`, i.e. 30 min).
+
+**Optional env vars (admin commands and access cache):**
+
+- `BOOTSTRAP_ADMIN_EMAILS` — comma-separated emails allowed to call
+  `/grant` / `/revoke` / `/list-access`. Bootstrap admins are
+  governed here, never via the rules table they manage. Required
+  before any `RESTRICTED` workflow ships or any admin command can
+  succeed.
+- `ACCESS_CACHE_TTL_SECONDS` — how long compiled per-command
+  `AccessPolicy` objects are cached in-process (default `60`).
+  Bounds the cross-instance propagation delay after a `/grant`.
 
 ### 2.2 Context MCP (`mcp-servers/context-mcp/`)
 
@@ -216,12 +451,13 @@ single region (`us-central1`). Adjust as needed.
 | Cloud Run service `action-mcp` | Read/write MCP. Currently public ingress for PoC. |
 | Artifact Registry repo | Stores the three container images. |
 | Cloud Build (optional) | Build + push pipeline. Manual `gcloud builds submit` works for the PoC. |
-| Service account `backend-sa@…` | Identity for `agent-backend`. Needs Vertex AI access. |
+| Service account `backend-sa@…` | Identity for `agent-backend`. Needs Vertex AI access and Cloud SQL client access (for the session store). |
 | Service account `context-mcp-sa@…` | Identity for `context-mcp`. Domain-Wide Delegation enabled, authorized for Workspace read scopes. |
 | Service account `action-mcp-sa@…` | Identity for `action-mcp`. Member of the Shared Drive with **Contributor** (or **Manager**) permissions. |
+| Cloud SQL instance (Postgres) | Stores ADK session rows AND the `workflow_access_rules` table (managed by `access_store.py`). One database, one connection pool, one set of credentials — both stores share the SQLAlchemy engine. A single small instance is sufficient for the PoC. |
 | Shared Drive | Sole legal destination for any file the Action MCP creates. `action-mcp-sa` is a Drive member. |
 | Vertex AI / Gemini | LLM provider. `gemini-2.5-flash` in `us-central1`. |
-| Google Chat app | The user-facing surface. Webhook points at `agent-backend`'s Cloud Run URL. |
+| Google Chat app | The user-facing surface. Webhook points at `agent-backend`'s Cloud Run URL. All slash commands are registered in this one app's *Commands* configuration; the backend dispatches by `commandId`. |
 
 ### 3.2 Enabled APIs
 
@@ -238,6 +474,7 @@ In the GCP project:
 - `drive.googleapis.com`
 - `docs.googleapis.com`
 - `sheets.googleapis.com`
+- `sqladmin.googleapis.com` (Cloud SQL for the session store)
 
 ### 3.3 IAM roles
 
@@ -246,11 +483,14 @@ In the GCP project:
 | Role | Why |
 | --- | --- |
 | `roles/aiplatform.user` | Call Vertex AI / Gemini. |
+| `roles/cloudsql.client` | Connect to the session-store Cloud SQL instance via the Cloud SQL connector. |
 | `roles/run.invoker` on `context-mcp` (*future*) | Mint ID tokens to call the MCP. Not required while MCP services are public. |
 | `roles/run.invoker` on `action-mcp` (*future*) | Same. |
 | `roles/logging.logWriter` | Cloud Run runtime logs. Granted by default in most setups. |
 
-No Workspace scopes — the backend never calls Workspace APIs directly.
+The backend additionally mints tokens with the **`https://www.googleapis.com/auth/chat.bot`** OAuth scope to post async replies back into Chat spaces (see §1 request flow step 9, and `chat_client.py`). `chat.bot` is an OAuth scope, not a GCP IAM role — it does not appear in the IAM "add role" picker and there is no IAM binding to grant. The scope is requested at runtime by `google.auth.default(scopes=[...])`; Chat accepts the resulting call because `backend-sa` lives in the same project as the Chat API configuration, and the Cloud Run metadata server can mint a scoped token for it. The only project-level prerequisite beyond what is already in §3.2 is that **`chat.googleapis.com` is enabled** — there is no separate "bind this SA to the Chat app" step in the Chat API console.
+
+The backend does not call Workspace APIs directly (no Gmail / Drive / Docs / Sheets scopes); the only outbound Google API call is to Chat, for posting async replies.
 
 #### `context-mcp-sa` (Cloud Run runtime SA for `context-mcp`)
 
@@ -439,7 +679,48 @@ After each service is deployed once, copy the actual URL back into the
 relevant env var (`CHAT_APP_AUDIENCE`, `CONTEXT_MCP_SERVICE`,
 `ACTION_MCP_SERVICE`, `ALLOWED_HOSTS`) and redeploy.
 
-### 4.5 Google Chat app configuration
+### 4.5 Cloud SQL session store
+
+```bash
+INSTANCE=dual-mcp-sessions
+DB_NAME=adk_sessions
+
+gcloud sql instances create $INSTANCE \
+  --database-version=POSTGRES_15 \
+  --tier=db-f1-micro \
+  --region=$REGION
+
+gcloud sql databases create $DB_NAME --instance=$INSTANCE
+
+# A dedicated DB user for the backend.
+gcloud sql users create backend \
+  --instance=$INSTANCE \
+  --password=<generated-password>
+
+# Cloud SQL client role for the backend SA.
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:backend-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/cloudsql.client"
+```
+
+Then set `SESSION_DB_URL` on the backend Cloud Run service to a
+Cloud-SQL-connector URL pointing at the instance, e.g.
+
+```
+SESSION_DB_URL=postgresql+asyncpg://backend:<password>@/adk_sessions?host=/cloudsql/<project>:<region>:dual-mcp-sessions
+```
+
+and attach the Cloud SQL instance to the service:
+
+```bash
+gcloud run services update agent-backend \
+  --region=$REGION \
+  --add-cloudsql-instances=${PROJECT_ID}:${REGION}:${INSTANCE}
+```
+
+ADK's `DatabaseSessionService` will create its tables on first use.
+
+### 4.6 Google Chat app + slash command registration
 
 In the GCP project, **APIs & Services → Google Chat API → Configuration**:
 
@@ -448,9 +729,38 @@ In the GCP project, **APIs & Services → Google Chat API → Configuration**:
   group conversations*.
 - Connection settings: **App URL** = the `agent-backend` Cloud Run URL.
 - Permissions: restrict to your Workspace domain.
-- Save.
 
-Then install the app into a test space and send it a message.
+There is no separate field to associate a service account with the
+Chat app. Async replies (§1 step 9 and `chat_client.py`) work as long
+as `chat.googleapis.com` is enabled (§3.2) and `backend-sa` lives in
+this same project — the Cloud Run metadata server can then mint a
+token bearing the `chat.bot` OAuth scope, and Chat accepts the
+post-back. If async replies fail in production, the canary is a 403
+on `chat.spaces.messages.create` in `backend-sa`'s Cloud Logging
+stream; check that the Chat API is enabled and that the backend
+service is deployed into the project that owns the Chat app config.
+
+**Commands.** Register one entry per workflow in
+`agentic-backend/workflows.py`, plus the five reserved commands
+(handled by the dispatcher, not the LLM). The `Command ID` field must
+match the integer the backend dispatches on:
+
+| Command ID | Name | Description |
+| --- | --- | --- |
+| 1 | `/research` | Summarise findings from your personal Workspace data. |
+| 2 | `/draft` | Create or update a document on the Shared Drive. |
+| 3 | `/report` | Research → draft pipeline (`SequentialAgent` example). |
+| 995 | `/list-access` | Show access rules for a command (admins only). |
+| 996 | `/revoke` | Remove an access rule (admins only). |
+| 997 | `/grant` | Add an access rule (admins only). |
+| 998 | `/help` | Show available commands. |
+| 999 | `/exit` | End the current conversation. |
+
+The admin commands are visible to everyone in the autocomplete (Chat
+has no per-user UI filtering), but the backend rejects them for
+non-bootstrap-admins with an audit-logged denial.
+
+Save, then install the app into a test space and send it a message.
 
 ---
 
@@ -472,6 +782,27 @@ of the following must be true on the Context MCP process:
 There is no need to expose a Cloud Run URL during local dev — invoke
 the backend directly with a hand-crafted JSON payload to test event
 handling.
+
+`SESSION_DB_URL` defaults to `sqlite+aiosqlite:///./sessions.db`, so
+multi-turn workflows and the `workflow_access_rules` table both work
+out of the box against a single local SQLite file (gitignored).
+Delete the file to reset all state.
+
+To exercise the admin slash commands locally, set
+`BOOTSTRAP_ADMIN_EMAILS=you@example.com` before starting the backend
+and POST hand-crafted Chat payloads with your own email as
+`user.email`. The `manage_access.py` CLI also works against the
+local SQLite file — useful for seeding rules without going through
+the webhook:
+
+```powershell
+cd agentic-backend
+uv run python manage_access.py grant /draft email:alice@example.com
+uv run python manage_access.py list /draft
+```
+
+Email- and domain-based rules work without any extra configuration.
+Workspace group rules are not supported in this build.
 
 ---
 
@@ -520,11 +851,11 @@ project's serverless network at all.
   Host-header filter that prevents trivial cross-origin smuggling, but
   any attacker who can reach the service can also set the right Host
   header. Treat it as defence in depth, not a gate.
-- **Move the FastMCP session service off in-memory.** Today
-  `chat.py` uses `InMemorySessionService`. That's fine for single-turn
-  webhook events, but if you ever want multi-turn conversations you'll
-  need Firestore-backed sessions (and the backend SA will need
-  `roles/datastore.user`).
+- **Workflow registry in YAML.** Today `workflows.py` is a Python
+  module — typed, grep-friendly, and unit-testable, but every change
+  needs a redeploy. Past ~10 workflows a YAML schema (validated at
+  startup) lets non-engineers iterate on prompts without touching
+  Python. Defer until the registry grows.
 - **Vertex AI region pinning.** `LOCATION` defaults to `us-central1`.
   If Sanmina has a data residency requirement, set it explicitly and
   document it as a constraint — the `gemini-2.5-flash` model needs to
@@ -568,3 +899,27 @@ preserve them or document the reason for breaking them.
    Action MCP, and never the twain shall meet.** The security boundary
    is the separation of servers, not finer-grained scopes inside one
    server.
+8. **Slash command IDs are the lockstep contract.** Every
+   `command_id` in `workflows.WORKFLOWS` must be registered in the
+   Chat API console and vice versa. The backend dispatches by ID, not
+   by command text, so the integers must match exactly.
+9. **Workflow toolsets are structural.** A workflow scoped to
+   `{CONTEXT}` has no Action MCP attached to its agent at all — prompt
+   injection cannot route around the registry to reach the other MCP.
+10. **Backend authorization is the only access-control gate.** Google
+    Chat shows every slash command to every user with the app
+    installed; restricted workflows are rejected in `access.py`
+    against the verified `user.email`, and every denial is logged.
+11. **Workflow boundaries reset conversation history.** A new slash
+    command in an active thread deletes the prior ADK session before
+    creating the new one, so `/draft`'s system prompt never inherits
+    `/research`'s tool-call history (or vice versa).
+12. **Workflow definitions live in code; access rules live in the
+    database.** Adding a workflow requires a deploy; granting access
+    to one does not. The split exists so ops can manage ACLs at
+    runtime without touching the codebase.
+13. **Admin commands are governed by env vars, not the table they
+    manage.** `/grant`, `/revoke`, and `/list-access` check
+    `BOOTSTRAP_ADMIN_EMAILS` directly — they cannot grant or revoke
+    themselves, and a corrupted `workflow_access_rules` table cannot
+    lock admins out of fixing it.

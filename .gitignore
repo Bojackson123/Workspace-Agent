@@ -527,3 +527,7 @@ MigrationBackup/
 .ionide/
 
 # End of https://www.toptal.com/developers/gitignore/api/vs,python
+
+# Local ADK DatabaseSessionService SQLite file (dev default).
+sessions.db
+sessions.db-journal

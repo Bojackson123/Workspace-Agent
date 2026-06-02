@@ -11,4 +11,11 @@ dependencies = [
     "google-adk>=1.0.0",
     "mcp>=1.1.2",
     "python-dotenv>=1.1.0",
+    # Persistent session store (ADK DatabaseSessionService) and the
+    # workflow_access_rules table. ``aiosqlite`` covers local dev;
+    # production points SESSION_DB_URL at Cloud SQL Postgres (e.g.
+    # ``postgresql+asyncpg://…``).
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
 ]
