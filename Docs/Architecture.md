@@ -75,7 +75,9 @@ token — it only emits tool calls.
    chat@system.gserviceaccount.com`. The body is *not* parsed before
    this check passes.
 3. **Identity + payload extraction.** `agentic-backend/chat.py` reads
-   `body.user.email`, the slash command (`message.slashCommand.commandId`,
+   `body.user.email`, the user resource name (`body.user.name`,
+   format `users/USER_ID`) and display name for the anchor mention
+   (see step 9), the slash command (`message.slashCommand.commandId`,
    if any), the conversation thread (`message.thread.name`), and the
    prompt text (with the slash-command prefix stripped via the
    `SLASH_COMMAND` annotation).
@@ -92,9 +94,14 @@ token — it only emits tool calls.
    rejection.
 6. **Session resolve.** `sessions.py` looks up an ADK session keyed by
    `(user_email, sha256(thread.name))` in the `DatabaseSessionService`.
-   A new slash command always starts a fresh session; a free-form
-   continuation reuses the existing one (if within the inactivity TTL)
-   and inherits its active workflow.
+   For plain-message continuations the lookup happens in
+   `_handle_message` against the inbound `thread.name`. For slash
+   commands the lookup is **deferred** until the background task has
+   posted the public anchor message (step 9) and knows the
+   anchor thread's `thread.name` — the inbound slash thread is
+   private and never used as a session key. A free-form continuation
+   reuses the existing session (if within the inactivity TTL) and
+   inherits its active workflow.
 7. **Agent build.** `agentic-backend/agent.py:build_agent_for_workflow`
    constructs a fresh `LlmAgent` per request with the workflow's system
    instruction and only the MCP toolsets that workflow declares:
@@ -107,29 +114,77 @@ token — it only emits tool calls.
       API as them.
     - Action MCP authenticates with ADC (its own runtime SA) and writes
       to the Shared Drive.
-9. **Ack + async reply.** Google Chat shows a *"… is not responding"*
-   banner after roughly six seconds and hard-times-out the webhook
-   around thirty. Multi-tool agent runs blow past both, so the
-   dispatcher splits the response in two:
-    - **Synchronous ack** — the webhook immediately returns either the
-      workflow's `ack_message` (a short "On it…" line set per workflow
-      in `workflows/`) or an empty `{}` envelope when none is
-      configured. Plain follow-ups inside an active session always
-      return empty so the thread doesn't fill with "working on it"
-      noise.
-    - **Background run** — the agent run is enqueued onto FastAPI's
-      per-request `BackgroundTasks`. When the agent finishes, its
-      final text is converted from standard Markdown into Chat's
-      flavour (single-asterisk bold, `•` bullets, `<url|text>` links)
-      and posted back into the same `space.name` + `thread.name` via
-      `chat.spaces.messages.create` using `chat_client.py`.
-      Reserved commands (`/help`, `/exit`, `/grant`, …) never use the
-      background path — their responses are instant and return
-      synchronously.
+9. **Async reply via Chat REST.** Google Chat shows a *"… is not
+   responding"* banner after roughly six seconds and hard-times-out
+   the webhook around thirty. Multi-tool agent runs blow past both,
+   so the webhook always returns `{}` synchronously and every bot
+   message is posted via `chat.spaces.messages.create` from a
+   FastAPI `BackgroundTasks` job. The dispatch shape differs by
+   inbound type because Chat's threading rules differ:
+
+    - **Plain messages** (free-form follow-ups inside an existing
+      thread). The background task runs the agent and posts the
+      reply with `thread.name = inbound message.thread.name`. The
+      thread already exists and the bot can post into it. Final
+      text is converted from standard Markdown into Chat's flavour
+      (single-asterisk bold, `•` bullets, `<url|text>` links)
+      before posting.
+
+    - **Slash command invocations.** Slash commands are *private*
+      by Chat's design — the inbound is only visible to the invoker
+      and the bot, and bots cannot post threaded replies into a
+      private message (Chat returns 400 `INVALID_ARGUMENT` with
+      *"Can't create a private message as a threaded reply to
+      another private message"*). Instead the background task
+      (`_run_slash_workflow` in `chat.py`):
+        1. Posts a **public anchor message** in the space with no
+           thread targeting, so Chat creates a new top-level
+           thread. Body format:
+           `<users/USER_ID> {workflow.ack_message}\n\n_Follow up
+           messages will reply to this thread._` — the mention is
+           clickable (so the run appears in the user's mentions
+           list), the body is the workflow's configured ack, and
+           the suffix tells the space that follow-ups belong
+           inside.
+        2. Captures the `thread.name` Chat returned in the response
+           body — the **anchor thread**.
+        3. Resolves the ADK session keyed by the anchor thread with
+           the slash command's workflow as `active_workflow_id`,
+           starting it fresh (any prior session at that key — rare
+           in practice — is deleted).
+        4. Runs the agent against that session.
+        5. Posts the final reply with `thread.name = anchor_thread`.
+           It nests directly under the announcement.
+
+    - **Reserved commands** (`/help`, `/exit`, `/grant`, `/revoke`,
+      `/list-access`) never use the background path — their
+      responses are static and return synchronously from the
+      webhook.
+
+   The "follow-up continues the conversation" property falls out of
+   the session keying. A user's reply inside the anchor thread is a
+   plain message with `thread.name = anchor_thread` in the payload;
+   the plain-message path resolves the session by that key, finds
+   the session created in the slash flow above, and runs the same
+   workflow against the same conversation history. A new top-level
+   `/research` later produces a new anchor, a new thread, a fresh
+   session.
 
    ADK persists the conversation turn to the session DB during the
-   background run, so the next message in the same thread can resume
-   the workflow regardless of which path produced the reply.
+   background run, so the next message in the anchor thread can
+   resume the workflow regardless of which background function
+   produced the previous reply.
+
+   **Cloud Run requirement: CPU is always allocated.** The background
+   task outlives the inbound HTTP response. Under Cloud Run's default
+   per-request CPU allocation the instance is throttled to near-zero
+   the moment the ack returns, which stalls outbound TLS handshakes
+   from the background path — the post-back to `chat.googleapis.com`
+   intermittently fails with `SSLEOFError: UNEXPECTED_EOF_WHILE_READING`
+   as the server side gives up on the half-completed handshake. The
+   `agent-backend` service must therefore deploy with
+   `--no-cpu-throttling` (a.k.a. "CPU is always allocated"). See
+   §4.4 for the flag in the deploy command and §7 for the invariant.
 
 ### Why the email lives in a header, not a tool argument
 
@@ -228,15 +283,19 @@ command's own ACL.
 first message of an invocation; follow-ups in the same thread are
 plain `MESSAGE` events. To support continuations, `sessions.py` keys
 ADK sessions by `(user_email, sha256(thread.name))` and stores the
-active workflow's `command_id` in `Session.state`. Semantics:
+active workflow's `command_id` in `Session.state`. The session is
+always keyed by the **public** thread (anchor thread for slash
+invocations, inbound `thread.name` for plain messages) — the private
+slash thread is never used as a key, because the bot can't post into
+it. Semantics:
 
 | Inbound event | Behaviour |
 | --- | --- |
-| New slash command in thread | Delete any existing session for the thread, create a fresh one scoped to the new workflow. Conversation history does not leak between workflows. |
-| Free-form message with active session | Reuse the session, run the workflow whose `command_id` it stores. |
-| Free-form message, no active session | Run `DEFAULT_WORKFLOW` (the dual-MCP catch-all). |
+| Slash command (anywhere) | Background task posts a public anchor message in the space, captures the new `thread.name`, then creates a fresh ADK session keyed by the anchor thread scoped to the slash command's workflow. The inbound private slash thread is never stored. Any prior session at the anchor key (rare) is deleted first, so conversation history does not leak between workflows. |
+| Plain message with active session in same thread | Reuse the session, run the workflow whose `command_id` it stores. |
+| Plain message, no active session | Run `DEFAULT_WORKFLOW` (the dual-MCP catch-all) and key a session by the inbound `thread.name`. |
 | Idle > `SESSION_TTL_SECONDS` (default 30 min) | Session is expired on next read, then deleted. Next message falls back to default. |
-| `/exit` | Session deleted. |
+| `/exit` (typed inside the anchor thread) | Session for that thread deleted. |
 
 **Access control.** Workflow *definitions* live in code; *who may
 invoke them* lives in the database. Specifically:
@@ -308,16 +367,16 @@ per-request.
 
 | File | Responsibility |
 | --- | --- |
-| `main.py` | FastAPI app. Sets `GOOGLE_GENAI_USE_VERTEXAI=1` and `LOCATION` *before* importing google-genai, loads `.env`, mounts `verify_chat_jwt` as a dependency. |
+| `main.py` | FastAPI app. Configures the root logger at INFO via `logging.basicConfig(...)` *before* any module-level `log.*` call so app log lines reach Cloud Logging (Python's default WARNING level would silently drop them). Sets `GOOGLE_GENAI_USE_VERTEXAI=1` and `LOCATION` *before* importing google-genai, loads `.env`, mounts `verify_chat_jwt` as a dependency. |
 | `security.py` | `verify_chat_jwt` — validates the Google Chat OIDC token via `google.oauth2.id_token.verify_oauth2_token`, checks audience matches `CHAT_APP_AUDIENCE`, and rejects unless `claims.email == chat@system.gserviceaccount.com`. |
-| `chat.py` | `ChatEvent.from_payload` + `handle_event` / `_handle_message`. Parses Chat payloads (incl. `slashCommand.commandId`, `thread.name`, `space.name`, `SLASH_COMMAND` annotation), dispatches reserved commands inline (`/exit`, `/help`, plus the admin commands `/grant`, `/revoke`, `/list-access`), authorizes against the table-backed `AccessPolicy` combined with the workflow's `default_access`, resolves a persistent session via `SessionStore`, and **enqueues the agent run onto `BackgroundTasks`** instead of awaiting it inline — the sync return is just an ack so the webhook stays inside Chat's "not responding" window. `_markdown_to_chat()` translates standard Markdown into Chat's flavour before the reply is posted. Admin command bodies are parsed in code — never routed through the LLM — so prompt injection cannot reach the ACL writes. |
-| `chat_client.py` | Outbound REST client for Chat. `post_message_to_space(space_name, text, thread_name=...)` mints ADC credentials with the `chat.bot` scope and POSTs to `spaces.messages.create`, threading replies into the same conversation. Called only from the background-task path; failures are logged and swallowed since no synchronous response exists to attach an error to. |
+| `chat.py` | `ChatEvent.from_payload` + `handle_event` / `_handle_message`. Parses Chat payloads (incl. `slashCommand.commandId`, `thread.name`, `space.name`, `user.name`/`user.displayName` for the anchor mention, `SLASH_COMMAND` annotation), dispatches reserved commands inline (`/exit`, `/help`, plus the admin commands `/grant`, `/revoke`, `/list-access`), authorizes against the table-backed `AccessPolicy` combined with the workflow's `default_access`. The webhook always returns `{}` synchronously and the agent run is enqueued onto FastAPI's `BackgroundTasks` so the response stays inside Chat's "not responding" window. The background path is split in two: `_run_slash_workflow` handles slash invocations (posts a public anchor message first via `_build_anchor_text`, captures the anchor `thread.name`, resolves the ADK session keyed to it, runs the agent, posts the final reply into the anchor); `_run_plain_workflow` handles free-form continuations (just runs the agent and posts the reply with `thread.name = inbound message_thread`). `_markdown_to_chat()` translates standard Markdown into Chat's flavour before the reply is posted. Admin command bodies are parsed in code — never routed through the LLM — so prompt injection cannot reach the ACL writes. |
+| `chat_client.py` | Outbound REST client for Chat. `post_message_to_space(space_name, text, thread_name=..., thread_key=...)` mints ADC credentials with the `chat.bot` scope and POSTs to `spaces.messages.create`. Threading priority: `thread.name` (post into an existing thread, falling back to a new one via `REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`) → `thread.threadKey` (a client-supplied key Chat uses to create-or-route) → no thread targeting (Chat creates a fresh top-level thread). **Returns the `thread.name` Chat persisted the message to** so the slash-command anchor flow can capture and reuse it; returns `None` on failure. Called only from the background-task path; failures are logged and swallowed since no synchronous response exists to attach an error to. |
 | `workflows/` | Package, one module per command. `_base.py` defines the `Workflow` dataclass (with an async `build_agent` factory and an optional `ack_message` shown immediately on slash-command invocation), `AccessMode`/`ToolsetKind` enums, reserved-command IDs, `ADMIN_COMMAND_IDS`, `RESERVED_COMMAND_NAMES`. `_helpers.py` exposes `llm_workflow(...)` for the single-LlmAgent shorthand. `_default.py` holds `DEFAULT_WORKFLOW` (the free-form fallback). Each non-underscore module (`research.py`, `draft.py`, `sequential_report.py`, …) exports a `WORKFLOW` constant; `__init__.py` imports them explicitly into the `WORKFLOWS` dispatch dict and re-exports the public names. |
 | `access.py` | `AccessPolicy` dataclass + `authorize(user_email, command_id, default_mode, store)` — consults the store, applies `default_mode` on empty results, evaluates email and domain rules. `authorize_bootstrap_admin(user_email)` checks `BOOTSTRAP_ADMIN_EMAILS` for the admin slash commands. |
 | `access_store.py` | `AccessStore` and `WorkflowAccessRule` (SQLAlchemy). `load(command_id)` compiles rule rows into an `AccessPolicy` with per-process TTL caching; `grant` / `revoke` / `list_rules` for the admin slash commands. Shares the SQLAlchemy engine with the session service so the backend has one Cloud SQL pool per process. |
 | `manage_access.py` | Break-glass CLI mirroring the admin slash commands. Useful when bootstrap admins are misconfigured or for automated provisioning. |
 | `sessions.py` | `SessionStore` wrapping ADK's `DatabaseSessionService`. `resolve(user_email, thread_name, new_workflow_id)` enforces the new-command-resets-session and TTL-expiry semantics; `clear()` implements `/exit`. |
-| `agent.py` | Public building blocks workflow files reuse: `context_toolset(user_email)`, `action_toolset()`, `build_llm_agent(instruction, tools)`. `build_agent_for_workflow(workflow, user_email)` delegates to `workflow.build_agent(user_email)` — the dispatcher does not need to know whether the workflow returns one `LlmAgent` or a multi-step `SequentialAgent`. Module-level `root_agent` exists for the ADK CLI but has no toolsets attached. Imports from `workflows._base` only (not the package) to keep `workflows._helpers` → `agent` acyclic. |
+| `agent.py` | Public building blocks workflow files reuse: `context_toolset(user_email)`, `action_toolset()`, `build_llm_agent(instruction, tools)`. `build_agent_for_workflow(workflow, user_email)` delegates to `workflow.build_agent(user_email)` — the dispatcher does not need to know whether the workflow returns one `LlmAgent` or a multi-step `SequentialAgent`. Module-level `root_agent` exists for the ADK CLI but has no toolsets attached. Imports from `workflows._base` only (not the package) to keep `workflows._helpers` → `agent` acyclic. Both toolsets pass an explicit `timeout=30.0` (`_MCP_OPERATION_TIMEOUT_S`) to `StreamableHTTPConnectionParams`, overriding the ADK default of 5s; the default is too tight for a cold-start MCP Cloud Run instance where `initialize` + `tools/list` over Streamable HTTP comfortably exceed 5s. `sse_read_timeout` stays at the SDK default (300s) since only the per-operation timeout was firing. |
 | `config.py` | Memoised `Settings`: MCP URLs, `chat_audience`, `location`, `session_db_url`, `session_ttl_seconds`, `bootstrap_admin_emails` (governing admin slash commands), and `access_cache_ttl_seconds` for the compiled-policy cache. |
 | `Dockerfile` | Two-stage `uv` build → distroless-ish `python:3.12-slim`, non-root user, `uvicorn main:app --workers 1` on port 8080. |
 
@@ -364,7 +423,7 @@ Delegation and exposes Gmail / Drive / Docs read tools.
 | File | Responsibility |
 | --- | --- |
 | `server.py` | Builds `FastMCP` with `TransportSecuritySettings(allowed_hosts=...)`, registers all tools, exposes `app = mcp.streamable_http_app()`, and attaches `UserEmailMiddleware` *after* the ASGI app is constructed so the middleware wraps every MCP request. |
-| `identity.py` | `UserEmailMiddleware` copies `X-User-Email` → contextvar. `current_user_email()` reads it and raises if absent — tools cannot silently impersonate "no one." |
+| `identity.py` | `UserEmailMiddleware` copies `X-User-Email` → contextvar. `current_user_email()` reads it and raises if absent — tools cannot silently impersonate "no one." Implemented as a **pure ASGI middleware** (class with `__init__(self, app)` + `async __call__(self, scope, receive, send)`), **not** a Starlette `BaseHTTPMiddleware` subclass. `BaseHTTPMiddleware` wraps the downstream response through an `anyio` memory stream, which silently breaks the MCP Streamable HTTP transport — the long-lived `GET /mcp` SSE channel never delivers `tools/list` (or any subsequent tool-call) responses and the ADK client times out inside `mcp_toolset._execute_with_session`. It also runs `call_next` in a separate task, so `ContextVar.set()` in the middleware is not reliably visible to the tool handler. The pure-ASGI shape preserves SSE streaming and keeps the contextvar in the same task as the downstream handler. Do not migrate this back to `BaseHTTPMiddleware`. |
 | `auth.py` | `get_dwd_credentials(user_email)`. Three deployment paths: (a) Cloud Run / GCE — Compute Engine credentials sign DWD JWTs remotely via IAM `signBlob`. (b) Local dev with `gcloud auth application-default login --impersonate-service-account=` — same `signBlob` path. (c) Local dev with `GOOGLE_APPLICATION_CREDENTIALS` pointing at a JSON key — local signing. |
 | `clients.py` | Per-user `gmail() / drive() / docs()` factories. **No caching by user** — caching here would smear identity across concurrent requests on a long-running worker. |
 | `tools/gmail.py` | `search_emails(query, max_results)` — Gmail query language, returns `Email ID + Subject` rows. |
@@ -667,6 +726,7 @@ gcloud run deploy agent-backend \
   --service-account=backend-sa@${PROJECT_ID}.iam.gserviceaccount.com \
   --allow-unauthenticated \
   --ingress=all \
+  --no-cpu-throttling \
   --set-env-vars="\
 GOOGLE_CLOUD_PROJECT=${PROJECT_ID},\
 LOCATION=${REGION},\
@@ -674,6 +734,10 @@ CONTEXT_MCP_SERVICE=https://context-mcp-<hash>-uc.a.run.app,\
 ACTION_MCP_SERVICE=https://action-mcp-<hash>-uc.a.run.app,\
 CHAT_APP_AUDIENCE=https://agent-backend-<hash>-uc.a.run.app"
 ```
+
+`--no-cpu-throttling` is **required**, not optional. The webhook returns an ack synchronously and runs the agent inside a FastAPI `BackgroundTasks` job; once the ack response is sent, default per-request CPU allocation throttles the instance to near-zero and the background task's outbound TLS handshakes (e.g. posting the reply back to `chat.googleapis.com`) intermittently fail with `SSLEOFError`. See §1 step 9 and §7 invariant 14.
+
+The MCP services (`context-mcp`, `action-mcp`) do **not** need this flag — they only run work inside the inbound request and benefit from the cheaper per-request CPU mode.
 
 After each service is deployed once, copy the actual URL back into the
 relevant env var (`CHAT_APP_AUDIENCE`, `CONTEXT_MCP_SERVICE`,
@@ -910,9 +974,9 @@ preserve them or document the reason for breaking them.
     Chat shows every slash command to every user with the app
     installed; restricted workflows are rejected in `access.py`
     against the verified `user.email`, and every denial is logged.
-11. **Workflow boundaries reset conversation history.** A new slash
-    command in an active thread deletes the prior ADK session before
-    creating the new one, so `/draft`'s system prompt never inherits
+11. **Workflow boundaries reset conversation history.** Every slash
+    command creates a fresh anchor thread with a fresh ADK session
+    (see invariant 16), so `/draft`'s system prompt never inherits
     `/research`'s tool-call history (or vice versa).
 12. **Workflow definitions live in code; access rules live in the
     database.** Adding a workflow requires a deploy; granting access
@@ -923,3 +987,31 @@ preserve them or document the reason for breaking them.
     `BOOTSTRAP_ADMIN_EMAILS` directly — they cannot grant or revoke
     themselves, and a corrupted `workflow_access_rules` table cannot
     lock admins out of fixing it.
+14. **`agent-backend` Cloud Run runs with CPU always allocated.** The
+    webhook acks synchronously and runs the LLM/agent + the outbound
+    chat reply inside a FastAPI `BackgroundTasks` job. Under default
+    per-request CPU allocation the instance throttles the moment the
+    ack returns, stalling outbound TLS handshakes from the background
+    path. `--no-cpu-throttling` is a deployment-time invariant; the
+    MCP services do not need it.
+15. **Context MCP middleware is pure ASGI, not `BaseHTTPMiddleware`.**
+    `BaseHTTPMiddleware` wraps the response body through `anyio`,
+    which breaks the MCP Streamable HTTP SSE channel (the long-lived
+    `GET /mcp` stream silently fails to deliver tool/list responses
+    and the client times out). It also runs the downstream handler in
+    a separate task so `ContextVar.set()` is not reliably visible to
+    tool handlers. Any per-request state Context MCP needs to bind
+    must use the same pure-ASGI pattern in `identity.py`.
+16. **Slash command replies live in a public anchor thread.** Chat
+    classifies slash invocations as private messages and rejects
+    threaded bot replies into them (400 `INVALID_ARGUMENT`: *"Can't
+    create a private message as a threaded reply to another private
+    message"*). The backend therefore posts a public anchor message
+    in the space first, captures the thread Chat creates for it, and
+    uses that as both the ADK session key and the `thread.name`
+    target for every subsequent reply (ack body + final + follow-ups
+    the user types inside the thread). Consequence — by design — is
+    that the slash invocation stays private to the user, but the
+    bot's announcement, results, and any follow-up conversation are
+    visible to the whole space. Workflows that need private results
+    would have to ship a separate DM-only mode; none currently does.

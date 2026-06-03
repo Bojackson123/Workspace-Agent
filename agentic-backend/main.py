@@ -4,7 +4,17 @@ Receives Google Chat webhooks, verifies the inbound JWT, and forwards
 the payload to the chat event handler.
 """
 
+import logging
 import os
+
+# Configure root logger before any module-level log.* call so app logs
+# (chat.py, sessions.py, chat_client.py) actually reach Cloud Logging.
+# The Python default level is WARNING, which silently drops every
+# log.info() in the app.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 # google-genai inspects these on import, so they must be set before any
 # downstream module pulls google.genai into the import graph.

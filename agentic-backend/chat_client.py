@@ -58,19 +58,31 @@ async def post_message_to_space(
     text: str,
     *,
     thread_name: str | None = None,
-) -> None:
+    thread_key: str | None = None,
+) -> str | None:
     """Post *text* into *space_name* as the Chat app.
 
     *space_name* is the ``space.name`` field from the inbound event
-    (``spaces/AAAA...``). When *thread_name* is provided the message is
-    posted into that thread, falling back to a new thread if the named
-    one is gone. Failures are logged and swallowed — this is called
-    from a fire-and-forget background task and there is no synchronous
-    response to attach an error to.
+    (``spaces/AAAA...``). Threading is resolved in priority order:
+
+    * If *thread_name* is provided, post into that existing thread
+      (falling back to a new thread if the named one is gone).
+    * Otherwise, if *thread_key* is provided, Chat creates a thread
+      tagged with that client-supplied key on the first post and routes
+      subsequent posts with the same key into the same thread.
+    * Otherwise, the post lands in a brand-new top-level thread Chat
+      creates for it. The caller uses the returned ``thread.name`` to
+      route subsequent posts (and to key the ADK session) into that
+      same thread.
+
+    Returns the ``thread.name`` Chat persisted the message to, or
+    ``None`` on failure. Failures are logged and swallowed — this is
+    called from a fire-and-forget background task and there is no
+    synchronous response to attach an error to.
     """
     if not space_name:
         log.warning("post_message_to_space called without space_name; dropping")
-        return
+        return None
     url = f"{_CHAT_API_BASE}/{space_name}/messages"
     body: dict[str, object] = {"text": text}
     params: dict[str, str] = {}
@@ -79,18 +91,34 @@ async def post_message_to_space(
         # Without this, posting to an unknown thread is an error; we'd
         # rather start a new thread than drop the reply.
         params["messageReplyOption"] = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+    elif thread_key:
+        body["thread"] = {"threadKey": thread_key}
+        params["messageReplyOption"] = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+    log.info(
+        "Chat REST POST space=%s thread_name=%r thread_key=%r reply_opt=%r",
+        space_name,
+        thread_name,
+        thread_key,
+        params.get("messageReplyOption"),
+    )
     try:
-        await asyncio.to_thread(_post_sync, url, body, params)
+        return await asyncio.to_thread(_post_sync, url, body, params)
     except Exception:
         log.exception("Failed to post async Chat message to %s", space_name)
+        return None
 
 
 def _post_sync(
     url: str,
     body: dict[str, object],
     params: dict[str, str],
-) -> None:
-    """Blocking POST to the Chat REST API. Run in a worker thread."""
+) -> str | None:
+    """Blocking POST to the Chat REST API. Run in a worker thread.
+
+    Returns the ``thread.name`` Chat persisted the message to, so the
+    caller can anchor follow-up posts (and the ADK session) on that
+    thread when the request didn't specify one upfront.
+    """
     response = _get_session().post(
         url,
         json=body,
@@ -104,3 +132,15 @@ def _post_sync(
             response.text[:500],
         )
         response.raise_for_status()
+    try:
+        data = response.json()
+    except Exception:
+        log.info("Chat REST post OK (no JSON body)")
+        return None
+    returned_thread = (data.get("thread") or {}).get("name")
+    log.info(
+        "Chat REST post OK: returned_thread=%r returned_message=%r",
+        returned_thread,
+        data.get("name"),
+    )
+    return returned_thread

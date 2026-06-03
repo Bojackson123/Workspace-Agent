@@ -36,6 +36,16 @@ AGENT_DESCRIPTION = (
 )
 
 
+# Per-request operation timeout (seconds) for the MCP Streamable HTTP
+# client. The ADK default is 5s, which is too tight for cold Cloud Run
+# instances: initialize + tools/list can comfortably exceed 5s on a cold
+# start, and individual tool calls perform Google Workspace API requests
+# that take 1–3s each. 30s gives cold starts headroom without masking
+# genuinely stuck calls. ``sse_read_timeout`` stays at the SDK default
+# of 300s for the long-lived GET /mcp stream.
+_MCP_OPERATION_TIMEOUT_S: float = 30.0
+
+
 def context_toolset(user_email: str) -> MCPToolset:
     """Build the Context MCP toolset bound to *user_email*.
 
@@ -47,6 +57,7 @@ def context_toolset(user_email: str) -> MCPToolset:
         connection_params=StreamableHTTPConnectionParams(
             url=f"{settings().context_mcp_url}/mcp",
             headers={"X-User-Email": user_email},
+            timeout=_MCP_OPERATION_TIMEOUT_S,
         )
     )
 
@@ -61,6 +72,7 @@ def action_toolset() -> MCPToolset:
     return MCPToolset(
         connection_params=StreamableHTTPConnectionParams(
             url=f"{settings().action_mcp_url}/mcp",
+            timeout=_MCP_OPERATION_TIMEOUT_S,
         )
     )
 

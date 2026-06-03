@@ -169,6 +169,15 @@ runtime, not configured in IAM. See
 flow, and §3.3 / §4.6 for the failure-mode canary if posting ever
 breaks in production.
 
+> **Deploy note:** the background path requires the `agent-backend`
+> Cloud Run service to run with `--no-cpu-throttling` ("CPU is always
+> allocated"). With default per-request CPU allocation the instance
+> is throttled the moment the ack response is sent, and the
+> background task's outbound TLS handshake to `chat.googleapis.com`
+> intermittently fails mid-handshake (`SSLEOFError`). See
+> [`Docs/Architecture.md`](Docs/Architecture.md) §4.4 and §7
+> invariant 14.
+
 Google Chat does not support per-command UI visibility, so restricted
 commands are visible to everyone but rejected at the backend with an
 audit-logged denial.

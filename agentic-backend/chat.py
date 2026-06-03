@@ -90,6 +90,12 @@ class ChatEvent:
 
     event_type: str
     user_email: str | None
+    # Chat user resource name (``users/USER_ID``) and display name.
+    # ``user_resource`` is used to build a clickable ``<users/ID>``
+    # mention in the public anchor message; ``user_display`` is a
+    # human-readable fallback for logs and rendered text.
+    user_resource: str
+    user_display: str
     prompt: str
     slash_command_id: int | None
     thread_name: str
@@ -118,9 +124,13 @@ class ChatEvent:
 
         thread_name = _conversation_key(body, message)
 
+        user = body.get("user") or {}
+
         return cls(
             event_type=body.get("type", ""),
-            user_email=(body.get("user") or {}).get("email"),
+            user_email=user.get("email"),
+            user_resource=user.get("name") or "",
+            user_display=user.get("displayName") or "",
             prompt=_clean_prompt(message),
             slash_command_id=command_id,
             thread_name=thread_name,
@@ -132,21 +142,16 @@ class ChatEvent:
 def _conversation_key(body: dict, message: dict) -> str:
     """Return the stable key identifying the conversation a message belongs to.
 
-    In ROOM spaces, users deliberately reply-in-thread to start sub-
-    conversations, so threads are the right grain. In DMs and group
-    chats, Chat creates a fresh ``thread.name`` for every top-level
-    message unless the user explicitly clicks "Reply in thread" — keying
-    by thread there would split a continuous conversation across many
-    one-shot sessions. We key by ``space.name`` for those space types so
-    the whole DM behaves as one conversation, matching user expectation.
+    We always key by ``message.thread.name`` so each Chat thread gets
+    its own isolated session and memory. In DMs and group chats Chat
+    creates a fresh thread for every top-level message — that's exactly
+    the boundary we want: each new top-level prompt starts a fresh
+    conversation, while replies inside a thread continue it. We fall
+    back to ``space.name`` only when thread.name is unexpectedly empty.
     """
     space = body.get("space") or {}
-    space_type = (space.get("type") or space.get("spaceType") or "").upper()
     thread_name = (message.get("thread") or {}).get("name") or ""
     space_name = space.get("name") or ""
-
-    if space_type in {"DIRECT_MESSAGE", "DM", "GROUP_CHAT"}:
-        return space_name or thread_name
     return thread_name or space_name
 
 
@@ -258,7 +263,15 @@ async def _handle_message(
     if event.slash_command_id in ADMIN_COMMAND_IDS:
         return await _handle_admin_command(event)
 
-    # ---- Regular workflow dispatch ----
+    # ---- Slash command: Option C — anchor a fresh public thread ----
+    # Slash commands are private to the invoker by Chat's design, so
+    # we can't post bot replies into the slash thread (Chat rejects
+    # private→private threaded replies). Instead the background task
+    # posts a NEW public top-level message in the space, captures the
+    # returned thread.name, anchors the ADK session there, and routes
+    # all subsequent replies (ack + final + follow-ups) into that
+    # thread. The user's slash invocation stays private; the bot's
+    # work becomes visible in the space.
     if event.slash_command_id is not None:
         workflow = get_workflow(event.slash_command_id)
         if workflow is None:
@@ -288,12 +301,28 @@ async def _handle_message(
                 f"`{workflow.command_name}` is {decision.reason}. "
                 "Contact your admin if you need access."
             )
+        log.info(
+            "Scheduling slash %s for user=%s",
+            workflow.command_name,
+            event.user_email,
+        )
+        background_tasks.add_task(
+            _run_slash_workflow,
+            workflow=workflow,
+            user_email=event.user_email,
+            user_resource=event.user_resource,
+            user_display=event.user_display,
+            prompt=event.prompt,
+            space_resource=event.space_resource,
+        )
+        return {}
 
+    # ---- Plain message: continue an existing thread ----
     try:
         resolved = await _session_store.resolve(
             user_email=event.user_email,
             thread_name=event.thread_name,
-            new_workflow_id=event.slash_command_id,
+            new_workflow_id=None,
         )
     except Exception:
         log.exception("Failed to resolve session for %s", event.user_email)
@@ -303,7 +332,7 @@ async def _handle_message(
 
     workflow = _workflow_for(resolved.active_workflow_id)
     log.info(
-        "Scheduling %s for user=%s thread=%s (new_session=%s)",
+        "Scheduling plain %s for user=%s thread=%s (new_session=%s)",
         workflow.command_name,
         event.user_email,
         event.thread_name,
@@ -311,7 +340,7 @@ async def _handle_message(
     )
 
     background_tasks.add_task(
-        _run_agent_and_post,
+        _run_plain_workflow,
         workflow=workflow,
         user_email=event.user_email,
         session_id=resolved.session.id,
@@ -320,11 +349,6 @@ async def _handle_message(
         message_thread=event.message_thread,
     )
 
-    # Only slash-command invocations carry an opt-in ack — plain
-    # follow-ups inside an active session stay silent so the thread
-    # doesn't fill with "working on it" noise.
-    if event.slash_command_id is not None and workflow.ack_message:
-        return chat_text(workflow.ack_message)
     return {}
 
 
@@ -541,7 +565,122 @@ def _resolve_reserved(arg: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_agent_and_post(
+_FOLLOWUP_HINT: Final = "_Follow up messages will reply to this thread._"
+
+_GENERIC_REPLY_FAILED: Final = (
+    "I ran into an unexpected error while processing that request."
+)
+
+
+def _build_anchor_text(
+    *,
+    user_resource: str,
+    user_display: str,
+    workflow: Workflow,
+) -> str:
+    """Build the public anchor message that starts a slash workflow.
+
+    The user is mentioned (with a clickable ``<users/ID>`` annotation
+    when we have their resource name, or just their display name as a
+    fallback) so the run shows up in their mentions. The workflow's
+    ack message is the body. A trailing hint tells the space that
+    follow-ups belong inside the thread we're about to create.
+    """
+    if user_resource:
+        mention = f"<{user_resource}>"
+    elif user_display:
+        mention = user_display
+    else:
+        mention = "Someone"
+    body = workflow.ack_message or f"Working on `{workflow.command_name}`..."
+    return f"{mention} {body}\n\n{_FOLLOWUP_HINT}"
+
+
+async def _run_slash_workflow(
+    *,
+    workflow: Workflow,
+    user_email: str,
+    user_resource: str,
+    user_display: str,
+    prompt: str,
+    space_resource: str,
+) -> None:
+    """Background task for slash-command invocations (Option C anchor flow).
+
+    Steps:
+      1. Post a public anchor message in the space (no thread targeting).
+         Chat creates a new top-level thread; the REST response carries
+         its ``thread.name`` back to us.
+      2. Resolve an ADK session keyed by that thread, with the slash
+         command's workflow as the active workflow. This is the session
+         the agent writes to and that future plain-message follow-ups
+         inside the thread will reuse.
+      3. Run the agent.
+      4. Post the final reply into the anchor thread so it nests
+         directly under the announcement.
+    """
+    anchor_text = _build_anchor_text(
+        user_resource=user_resource,
+        user_display=user_display,
+        workflow=workflow,
+    )
+    anchor_thread = await post_message_to_space(space_resource, anchor_text)
+    if not anchor_thread:
+        log.error(
+            "Anchor post failed; aborting slash workflow user=%s command=%s",
+            user_email,
+            workflow.command_name,
+        )
+        return
+
+    try:
+        resolved = await _session_store.resolve(
+            user_email=user_email,
+            thread_name=anchor_thread,
+            new_workflow_id=workflow.command_id,
+        )
+    except Exception:
+        log.exception(
+            "Session resolve failed for anchor thread=%s user=%s",
+            anchor_thread,
+            user_email,
+        )
+        await post_message_to_space(
+            space_resource,
+            _GENERIC_REPLY_FAILED,
+            thread_name=anchor_thread,
+        )
+        return
+
+    try:
+        reply = await _run_agent(
+            workflow=workflow,
+            user_email=user_email,
+            session_id=resolved.session.id,
+            prompt=prompt,
+        )
+    except Exception:
+        log.exception(
+            "Background agent run failed: workflow=%s user=%s",
+            workflow.command_name,
+            user_email,
+        )
+        await post_message_to_space(
+            space_resource,
+            _GENERIC_REPLY_FAILED,
+            thread_name=anchor_thread,
+        )
+        return
+
+    text = _markdown_to_chat(reply) if reply else "I wasn't able to generate a response."
+    await post_message_to_space(
+        space_resource,
+        text,
+        thread_name=anchor_thread,
+    )
+
+
+async def _run_plain_workflow(
     *,
     workflow: Workflow,
     user_email: str,
@@ -550,13 +689,14 @@ async def _run_agent_and_post(
     space_resource: str,
     message_thread: str,
 ) -> None:
-    """Background task: run the agent, post its reply back to Chat.
+    """Background task for plain-message continuations.
 
-    Lives off the request lifecycle so a long workflow no longer
-    blocks the webhook. Failures are reported back into the same
-    space as a Chat message — there is no synchronous response left
-    to attach an error to.
+    Plain messages in non-slash threads can be replied to directly with
+    ``thread.name`` — no anchor dance needed. Used for free-form
+    follow-ups inside an anchor thread the bot previously created, and
+    for plain @mentions / DMs.
     """
+    thread_name = message_thread or None
     try:
         reply = await _run_agent(
             workflow=workflow,
@@ -572,8 +712,8 @@ async def _run_agent_and_post(
         )
         await post_message_to_space(
             space_resource,
-            "I ran into an unexpected error while processing that request.",
-            thread_name=message_thread or None,
+            _GENERIC_REPLY_FAILED,
+            thread_name=thread_name,
         )
         return
 
@@ -581,7 +721,7 @@ async def _run_agent_and_post(
     await post_message_to_space(
         space_resource,
         text,
-        thread_name=message_thread or None,
+        thread_name=thread_name,
     )
 
 
