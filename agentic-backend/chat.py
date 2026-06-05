@@ -68,8 +68,9 @@ WELCOME_MESSAGE: Final = (
 
 _GRANT_USAGE: Final = (
     "Usage: `/grant <command> <type>:<principal>`\n"
-    "  type is one of `email`, `domain`, `group`.\n"
-    "  example: `/grant /audit group:finance-leads@example.com`"
+    "  type is one of `email`, `domain`.\n"
+    "  examples: `/grant /audit email:alice@example.com`  "
+    "`/grant /audit domain:example.com`"
 )
 _REVOKE_USAGE: Final = (
     "Usage: `/revoke <command> <type>:<principal>` "

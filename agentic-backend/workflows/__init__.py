@@ -47,7 +47,9 @@ from workflows._helpers import llm_workflow
 
 # ---- Per-command imports -------------------------------------------------
 from workflows.draft import WORKFLOW as _DRAFT_WORKFLOW
+from workflows.meeting_engine import WORKFLOW as _MEETING_WORKFLOW
 from workflows.research import WORKFLOW as _RESEARCH_WORKFLOW
+from workflows.review_board import WORKFLOW as _REVIEW_WORKFLOW
 from workflows.sequential_report import WORKFLOW as _REPORT_WORKFLOW
 
 # Explicit dispatch list. Comment out an entry to temporarily disable a
@@ -56,6 +58,8 @@ _REGISTERED: list[Workflow] = [
     _RESEARCH_WORKFLOW,
     _DRAFT_WORKFLOW,
     _REPORT_WORKFLOW,
+    _MEETING_WORKFLOW,
+    _REVIEW_WORKFLOW,
 ]
 
 

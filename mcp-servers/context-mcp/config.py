@@ -28,12 +28,12 @@ class Settings:
     """Immutable view of the Context MCP's runtime configuration."""
 
     server_name: str = "Context MCP Server"
-    allowed_hosts: tuple[str, ...] = ("localhost",)
+    allowed_hosts: tuple[str, ...] = ("localhost:*",)
 
 
 @cache
 def settings() -> Settings:
     """Return the process-wide ``Settings`` instance, building it on first call."""
     return Settings(
-        allowed_hosts=_parse_allowed_hosts(os.getenv("ALLOWED_HOSTS", "localhost")),
+        allowed_hosts=_parse_allowed_hosts(os.getenv("ALLOWED_HOSTS", "localhost:*")),
     )

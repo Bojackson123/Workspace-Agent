@@ -41,7 +41,7 @@ class Settings:
     shared_drive_id: str | None = None
 
     # Allowed Host headers for the streamable-HTTP transport.
-    allowed_hosts: tuple[str, ...] = ("localhost",)
+    allowed_hosts: tuple[str, ...] = ("localhost:*",)
 
     def require_shared_drive_id(self) -> str:
         """Return the Shared Drive ID, raising a clear error if it's unset."""
@@ -58,5 +58,5 @@ def settings() -> Settings:
     """Return the process-wide ``Settings`` instance, building it on first call."""
     return Settings(
         shared_drive_id=os.getenv("SHARED_DRIVE_ID") or None,
-        allowed_hosts=_parse_allowed_hosts(os.getenv("ALLOWED_HOSTS", "localhost")),
+        allowed_hosts=_parse_allowed_hosts(os.getenv("ALLOWED_HOSTS", "localhost:*")),
     )

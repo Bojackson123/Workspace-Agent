@@ -7,9 +7,7 @@ the dispatcher returns an ack immediately and runs the agent in a
 background task; the agent's final reply is posted back into the same
 space via this REST client.
 
-The backend's Cloud Run service account is also the Chat app identity
-(configured in the Google Chat API console), so calling
-``chat.spaces.messages.create`` with ``chat.bot`` scope posts as the
+Calling ``chat.spaces.messages.create`` with ``chat.bot`` scope posts as the
 app — no extra credentials, no per-user OAuth.
 
 Only one helper is exposed: :func:`post_message_to_space`. It runs the

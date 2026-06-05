@@ -33,3 +33,8 @@ def drive(user_email: str) -> Resource:
 def docs(user_email: str) -> Resource:
     """Docs v1 service authenticated as *user_email*."""
     return _service("docs", "v1", user_email)
+
+
+def calendar(user_email: str) -> Resource:
+    """Calendar v3 service authenticated as *user_email*."""
+    return _service("calendar", "v3", user_email)

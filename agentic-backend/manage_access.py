@@ -14,7 +14,6 @@ Usage:
 
     python manage_access.py grant <command> email:<addr>
     python manage_access.py grant <command> domain:<domain>
-    python manage_access.py grant <command> group:<group-addr>
     python manage_access.py revoke <command> <type>:<principal>
     python manage_access.py list <command>
     python manage_access.py list-all

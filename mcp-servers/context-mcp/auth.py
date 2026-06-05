@@ -29,16 +29,23 @@ from google.auth.iam import Signer
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 
-# Read-only scopes for personal user data. Read-only is enforced *at this
-# layer* — the LLM can never escalate by passing wider scopes because
-# the credentials it ultimately uses are minted here.
+# Scopes for personal user data. Read-only scopes cover Gmail/Drive/Docs
+# browsing; gmail.compose and calendar.events are write-narrow scopes added
+# for the Meeting Engine (draft creation and calendar holds only).
+# Enforcement is structural — the LLM can never escalate beyond these scopes.
+#
+# DEPLOYMENT NOTE: The DWD grant in Google Admin Console must also include
+# https://www.googleapis.com/auth/gmail.compose and
+# https://www.googleapis.com/auth/calendar.events for context-mcp-sa.
 SCOPES: tuple[str, ...] = (
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/documents.readonly",
     "https://www.googleapis.com/auth/chat.spaces.readonly",
     "https://www.googleapis.com/auth/chat.memberships.readonly",
     "https://www.googleapis.com/auth/chat.messages.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
 )
 
 # Scope used when bootstrapping ADC for the IAM signBlob call. We MUST
