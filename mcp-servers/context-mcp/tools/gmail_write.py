@@ -18,6 +18,27 @@ from identity import current_user_email
 log = logging.getLogger(__name__)
 
 
+def _normalise_recipient(raw: str) -> str:
+    """Convert an attendee string to a valid RFC 2822 recipient.
+
+    The meeting parser stores attendees as ``"Full Name (email@domain.com)"``.
+    Gmail rejects parentheses-wrapped addresses; convert to angle-bracket form.
+
+    Handles three input shapes:
+    - ``"Full Name (email@domain.com)"``  →  ``"Full Name <email@domain.com>"``
+    - ``"email@domain.com"``              →  ``"email@domain.com"``  (unchanged)
+    - ``"Full Name"``                     →  ``"Full Name"``          (unchanged)
+    """
+    raw = raw.strip()
+    if raw.endswith(")") and "(" in raw:
+        paren_start = raw.rfind("(")
+        email = raw[paren_start + 1 : -1].strip()
+        name = raw[:paren_start].strip()
+        if "@" in email:
+            return f"{name} <{email}>" if name else email
+    return raw
+
+
 def create_gmail_draft(to: str, subject: str, body: str) -> str:
     """Create a Gmail draft in the calling user's account.
 
@@ -36,7 +57,7 @@ def create_gmail_draft(to: str, subject: str, body: str) -> str:
     service = gmail_service(user_email)
 
     msg = MIMEText(body)
-    msg["to"] = to
+    msg["to"] = _normalise_recipient(to)
     msg["from"] = user_email
     msg["subject"] = subject
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")

@@ -29,7 +29,8 @@ class ParsedMeeting(BaseModel):
 # ── Intermediate planning types (no tools; written to state by fan-out) ────
 
 class EmailDraft(BaseModel):
-    owner: str
+    owner: str           # display name, used for grouping/greeting
+    to: str              # resolved recipient ("Name (email)" or email) for sending
     subject: str
     body: str
 

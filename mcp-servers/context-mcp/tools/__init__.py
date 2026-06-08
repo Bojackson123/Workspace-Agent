@@ -7,7 +7,7 @@ instance. ``register_all`` is a convenience helper for ``server.py``.
 
 from mcp.server.fastmcp import FastMCP
 
-from . import calendar, docs, drive, gmail, gmail_write
+from . import calendar, directory, docs, drive, gmail, gmail_write
 
 
 def register_all(mcp: FastMCP) -> None:
@@ -17,6 +17,15 @@ def register_all(mcp: FastMCP) -> None:
     drive.register(mcp)
     docs.register(mcp)
     calendar.register(mcp)
+    directory.register(mcp)
 
 
-__all__ = ["register_all", "gmail", "gmail_write", "drive", "docs", "calendar"]
+__all__ = [
+    "register_all",
+    "gmail",
+    "gmail_write",
+    "drive",
+    "docs",
+    "calendar",
+    "directory",
+]

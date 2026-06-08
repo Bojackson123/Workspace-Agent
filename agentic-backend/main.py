@@ -7,14 +7,14 @@ the payload to the chat event handler.
 import logging
 import os
 
-# Configure root logger before any module-level log.* call so app logs
-# (chat.py, sessions.py, chat_client.py) actually reach Cloud Logging.
-# The Python default level is WARNING, which silently drops every
-# log.info() in the app.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# Logging and tracing must be configured before importing any application
+# module so that module-level loggers and the OTel tracer provider are both
+# ready by the time chat.py / sessions.py pull them in.
+from logging_setup import configure_logging  # noqa: E402
+from tracing_setup import configure_tracing  # noqa: E402
+
+configure_logging()
+configure_tracing()
 
 # google-genai inspects these on import, so they must be set before any
 # downstream module pulls google.genai into the import graph.
@@ -29,10 +29,13 @@ from typing import Any  # noqa: E402
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Request  # noqa: E402
 
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor  # noqa: E402
+
 from chat import handle_event  # noqa: E402
 from security import verify_chat_jwt  # noqa: E402
 
 app = FastAPI(title="Dual-MCP Agent Backend")
+FastAPIInstrumentor.instrument_app(app)
 
 
 @app.post("/")

@@ -5,6 +5,7 @@ Drive — use ``create_workspace_file`` from the Drive tools (or
 ``create_document`` below) to create one first.
 """
 
+import re
 from typing import Final
 
 from googleapiclient.errors import HttpError
@@ -13,6 +14,12 @@ from mcp.server.fastmcp import FastMCP
 from clients import docs as docs_service
 from clients import drive as drive_service
 from config import settings
+
+# Markdown line patterns, recognised by append_markdown.
+_HEADING_RE: Final = re.compile(r"^(#{1,6})\s+(.*)$")
+_BULLET_RE: Final = re.compile(r"^\s*[-*+•]\s+(.*)$")
+_BOLD_RE: Final = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_INLINE_CODE_RE: Final = re.compile(r"`([^`]+)`")
 
 # The Docs body always ends with a trailing newline element. Inserting at
 # the document's reported end index would land *after* that newline and
@@ -98,6 +105,125 @@ def append_text(document_id: str, text: str) -> str:
     return f"Appended {len(text)} characters to {document_id}."
 
 
+def _inline_styling(content: str) -> tuple[str, list[tuple[int, int]]]:
+    """Strip inline markdown from one line → (clean_text, bold_ranges).
+
+    Inline code backticks are removed without styling; bold markers
+    (``**..**`` / ``__..__``) are removed and their spans recorded as
+    (start, end) offsets within the cleaned line.
+    """
+    content = _INLINE_CODE_RE.sub(r"\1", content)
+    out: list[str] = []
+    bold: list[tuple[int, int]] = []
+    i, n = 0, len(content)
+    while i < n:
+        if content.startswith("**", i) or content.startswith("__", i):
+            marker = content[i : i + 2]
+            end = content.find(marker, i + 2)
+            if end != -1:
+                inner = content[i + 2 : end]
+                start_clean = sum(len(p) for p in out)
+                out.append(inner)
+                bold.append((start_clean, start_clean + len(inner)))
+                i = end + 2
+                continue
+        out.append(content[i])
+        i += 1
+    return "".join(out), bold
+
+
+def _markdown_to_doc_requests(
+    markdown: str, start_index: int
+) -> list[dict]:
+    """Convert *markdown* into Docs ``batchUpdate`` requests.
+
+    Emits one ``insertText`` for the whole cleaned text, then paragraph-level
+    styling (headings, bullets) and text-level styling (bold) with absolute
+    indices. Indices assume the text lands at *start_index* (the document's
+    current end), so styling requests in the same batch reference the
+    post-insert positions. Styling requests do not change text length, so the
+    indices stay valid across the batch.
+    """
+    lines = markdown.split("\n")
+    clean_lines: list[str] = []
+    kinds: list[tuple[str, int]] = []  # ("heading", level) | ("bullet", 0) | ("para", 0)
+    bold_abs: list[tuple[int, int]] = []
+
+    pos = start_index
+    for raw in lines:
+        heading = _HEADING_RE.match(raw)
+        bullet = _BULLET_RE.match(raw)
+        if heading:
+            content, kind = heading.group(2), ("heading", len(heading.group(1)))
+        elif bullet:
+            content, kind = bullet.group(1), ("bullet", 0)
+        else:
+            content, kind = raw, ("para", 0)
+        clean, bolds = _inline_styling(content)
+        for s, e in bolds:
+            bold_abs.append((pos + s, pos + e))
+        clean_lines.append(clean)
+        kinds.append(kind)
+        pos += len(clean) + 1  # + the newline that terminates this paragraph
+
+    full_text = "\n".join(clean_lines) + "\n"
+    requests: list[dict] = [
+        {"insertText": {"location": {"index": start_index}, "text": full_text}}
+    ]
+
+    pos = start_index
+    for clean, kind in zip(clean_lines, kinds):
+        para_start, para_end = pos, pos + len(clean) + 1  # include the newline
+        if kind[0] == "heading":
+            requests.append({
+                "updateParagraphStyle": {
+                    "range": {"startIndex": para_start, "endIndex": para_end},
+                    "paragraphStyle": {"namedStyleType": f"HEADING_{kind[1]}"},
+                    "fields": "namedStyleType",
+                }
+            })
+        elif kind[0] == "bullet":
+            requests.append({
+                "createParagraphBullets": {
+                    "range": {"startIndex": para_start, "endIndex": para_end},
+                    "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+                }
+            })
+        pos = para_end
+
+    for s, e in bold_abs:
+        if e > s:
+            requests.append({
+                "updateTextStyle": {
+                    "range": {"startIndex": s, "endIndex": e},
+                    "textStyle": {"bold": True},
+                    "fields": "bold",
+                }
+            })
+    return requests
+
+
+def append_markdown(document_id: str, markdown: str) -> str:
+    """Append *markdown* to a Google Doc, rendered as native formatting.
+
+    Supports ATX headings (``# … ######``), unordered bullets
+    (``-`` / ``*`` / ``•``), bold (``**…**`` / ``__…__``), and inline code.
+    Anything else is inserted as plain text. Prefer this over ``append_text``
+    for LLM-authored markdown so the document does not show literal ``#`` /
+    ``-`` / ``**`` characters.
+    """
+    try:
+        index = _document_end_index(document_id)
+        requests = _markdown_to_doc_requests(markdown, index)
+        docs_service().documents().batchUpdate(
+            documentId=document_id,
+            body={"requests": requests},
+        ).execute()
+    except HttpError as exc:
+        return f"Error appending markdown: {exc}"
+    return f"Appended {len(markdown)} characters of markdown to {document_id}."
+
+
 def insert_text(document_id: str, index: int, text: str) -> str:
     """Insert *text* at *index* within a Google Doc.
 
@@ -158,6 +284,7 @@ _TOOLS = (
     create_document,
     read_document,
     append_text,
+    append_markdown,
     insert_text,
     replace_text,
 )

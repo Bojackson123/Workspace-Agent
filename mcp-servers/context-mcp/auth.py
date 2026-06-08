@@ -34,9 +34,12 @@ from google.oauth2 import service_account
 # for the Meeting Engine (draft creation and calendar holds only).
 # Enforcement is structural — the LLM can never escalate beyond these scopes.
 #
-# DEPLOYMENT NOTE: The DWD grant in Google Admin Console must also include
-# https://www.googleapis.com/auth/gmail.compose and
-# https://www.googleapis.com/auth/calendar.events for context-mcp-sa.
+# DEPLOYMENT NOTE: The DWD grant in Google Admin Console must authorise the
+# full scope set below for context-mcp-sa's client ID — DWD authorises the
+# requested scopes atomically, so any scope missing from the Admin Console
+# entry fails every impersonated token request. In particular this includes
+# gmail.compose, calendar.events, and directory.readonly (People API lookups
+# for the meeting invite dialog's org people picker).
 SCOPES: tuple[str, ...] = (
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
@@ -46,6 +49,7 @@ SCOPES: tuple[str, ...] = (
     "https://www.googleapis.com/auth/chat.memberships.readonly",
     "https://www.googleapis.com/auth/chat.messages.readonly",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/directory.readonly"
 )
 
 # Scope used when bootstrapping ADC for the IAM signBlob call. We MUST

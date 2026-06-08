@@ -106,6 +106,111 @@ async def post_message_to_space(
         return None
 
 
+async def post_card_to_space(
+    space_name: str,
+    card_body: dict,
+    *,
+    thread_name: str | None = None,
+) -> str | None:
+    """Post a Cards v2 message into *space_name* as the Chat app.
+
+    *card_body* must be a full message body dict containing a ``cardsV2``
+    key (no ``text`` key). Returns the ``message.name`` Chat assigned to
+    the posted message so the caller can update the card later, or ``None``
+    on failure.
+    """
+    if not space_name:
+        log.warning("post_card_to_space called without space_name; dropping")
+        return None
+    url = f"{_CHAT_API_BASE}/{space_name}/messages"
+    body: dict[str, object] = dict(card_body)
+    params: dict[str, str] = {}
+    if thread_name:
+        body["thread"] = {"name": thread_name}
+        params["messageReplyOption"] = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+    log.info(
+        "Chat REST card POST space=%s thread_name=%r",
+        space_name,
+        thread_name,
+    )
+    try:
+        return await asyncio.to_thread(_post_card_sync, url, body, params)
+    except Exception:
+        log.exception("Failed to post card to %s", space_name)
+        return None
+
+
+async def update_card_in_space(
+    message_name: str,
+    card_body: dict,
+) -> None:
+    """Replace a card message in place (PUT with updateMask=cardsV2).
+
+    *message_name* is the ``message.name`` field returned when the card
+    was first posted (``spaces/.../messages/...``).
+    """
+    if not message_name:
+        log.warning("update_card_in_space called without message_name; dropping")
+        return
+    url = f"{_CHAT_API_BASE}/{message_name}"
+    params = {"updateMask": "cardsV2"}
+    log.info("Chat REST card PUT message=%s", message_name)
+    try:
+        await asyncio.to_thread(_put_sync, url, card_body, params)
+    except Exception:
+        log.exception("Failed to update card %s", message_name)
+
+
+def _post_card_sync(
+    url: str,
+    body: dict[str, object],
+    params: dict[str, str],
+) -> str | None:
+    """Blocking POST for a card message. Returns the message.name."""
+    response = _get_session().post(
+        url,
+        json=body,
+        params=params,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not response.ok:
+        log.error(
+            "Chat REST card post failed: status=%s body=%s",
+            response.status_code,
+            response.text[:500],
+        )
+        response.raise_for_status()
+    try:
+        data = response.json()
+    except Exception:
+        return None
+    msg_name = data.get("name")
+    log.info("Chat REST card post OK: message_name=%r", msg_name)
+    return msg_name
+
+
+def _put_sync(
+    url: str,
+    body: dict[str, object],
+    params: dict[str, str],
+) -> None:
+    """Blocking PUT to update a card message in place."""
+    response = _get_session().put(
+        url,
+        json=body,
+        params=params,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not response.ok:
+        log.error(
+            "Chat REST card PUT failed: status=%s body=%s",
+            response.status_code,
+            response.text[:500],
+        )
+        response.raise_for_status()
+    log.info("Chat REST card PUT OK: url=%s", url)
+
+
 def _post_sync(
     url: str,
     body: dict[str, object],

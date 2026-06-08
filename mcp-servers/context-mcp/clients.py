@@ -38,3 +38,13 @@ def docs(user_email: str) -> Resource:
 def calendar(user_email: str) -> Resource:
     """Calendar v3 service authenticated as *user_email*."""
     return _service("calendar", "v3", user_email)
+
+
+def people(user_email: str) -> Resource:
+    """People API v1 service authenticated as *user_email*.
+
+    Used to resolve Chat ``users/<id>`` selections from the org people
+    picker into email addresses (requires the ``directory.readonly`` DWD
+    scope already declared in :mod:`auth`).
+    """
+    return _service("people", "v1", user_email)
