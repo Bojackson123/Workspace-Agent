@@ -1292,8 +1292,8 @@ def _build_invite_dialog(
             "type": "MULTI_SELECT",
             "multiSelectMaxSelectedItems": 20,
             "multiSelectMinQueryLength": 1,
-            # CommonDataSource enum value is USER (singular) — searches the
-            # caller's Google Workspace directory. "USERS" is rejected.
+            # CommonDataSource enum value is USER searches the
+            # caller's Google Workspace directory.
             "platformDataSource": {"commonDataSource": "USER"},
         }})
         widgets.append({"textInput": {
@@ -1376,6 +1376,18 @@ async def _handle_submit_invites(
 
     selections = _parse_invite_form_inputs(evt.form_inputs)
     chosen = {iid: sel for iid, sel in selections.items() if any(sel.values())}
+    # The USER picker's search is server-side and never reaches us, but the
+    # SELECTED users/<id> values DO arrive here on submit — log them so the
+    # end-to-end selection→resolution path is visible in Cloud Run logs.
+    log.info(
+        "invite.submit.selections",
+        extra={"json_fields": {
+            "invoker_email": invoker_email,
+            "thread_name": thread_name,
+            "raw_form_input_keys": list(evt.form_inputs.keys()),
+            "chosen": chosen,
+        }},
+    )
     if not chosen:
         return _invite_action_status("OK", "No people selected — nothing to invite.")
 
@@ -1425,6 +1437,7 @@ async def _apply_invites(
                 if "@" in piece:
                     emails.add(piece)
         org_ids = sel.get("org", [])
+        resolved_emails: list[str] = []
         if org_ids:
             try:
                 resolved_json = await call_context_tool(
@@ -1432,10 +1445,23 @@ async def _apply_invites(
                 )
                 for entry in json.loads(resolved_json):
                     if entry.get("email"):
+                        resolved_emails.append(entry["email"])
                         emails.add(entry["email"])
             except Exception:
                 log.exception("invite.apply: failed to resolve org people")
                 results.append(f"• {item_id}: could not resolve org people")
+        log.info(
+            "invite.apply.item",
+            extra={"json_fields": {
+                "item_id": item_id,
+                "event_id": event_id,
+                "attendee_emails": sel.get("attendees", []),
+                "external_raw": sel.get("ext", []),
+                "org_resource_names": org_ids,
+                "org_resolved_emails": resolved_emails,
+                "final_emails": sorted(emails),
+            }},
+        )
         if not emails:
             continue
         try:

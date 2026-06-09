@@ -15,6 +15,8 @@ from clients import docs as docs_service
 from clients import drive as drive_service
 from config import settings
 
+from ._retry import retry_on_transient
+
 # Markdown line patterns, recognised by append_markdown.
 _HEADING_RE: Final = re.compile(r"^(#{1,6})\s+(.*)$")
 _BULLET_RE: Final = re.compile(r"^\s*[-*+•]\s+(.*)$")
@@ -29,10 +31,10 @@ _TRAILING_NEWLINE_OFFSET: Final = 1
 
 def _document_end_index(document_id: str) -> int:
     """Return the insertion index for appending text at the end of a doc."""
-    doc = docs_service().documents().get(
+    doc = retry_on_transient(lambda: docs_service().documents().get(
         documentId=document_id,
         fields="body(content(endIndex))",
-    ).execute()
+    ).execute())
     content = doc.get("body", {}).get("content", [])
     if not content:
         # Empty doc — the only valid insertion index is 1.
@@ -92,14 +94,14 @@ def append_text(document_id: str, text: str) -> str:
     """Append *text* to the end of a Google Doc."""
     try:
         index = _document_end_index(document_id)
-        docs_service().documents().batchUpdate(
+        retry_on_transient(lambda: docs_service().documents().batchUpdate(
             documentId=document_id,
             body={
                 "requests": [
                     {"insertText": {"location": {"index": index}, "text": text}}
                 ]
             },
-        ).execute()
+        ).execute())
     except HttpError as exc:
         return f"Error appending text: {exc}"
     return f"Appended {len(text)} characters to {document_id}."
@@ -215,12 +217,27 @@ def append_markdown(document_id: str, markdown: str) -> str:
     try:
         index = _document_end_index(document_id)
         requests = _markdown_to_doc_requests(markdown, index)
-        docs_service().documents().batchUpdate(
+        retry_on_transient(lambda: docs_service().documents().batchUpdate(
             documentId=document_id,
             body={"requests": requests},
-        ).execute()
+        ).execute())
     except HttpError as exc:
-        return f"Error appending markdown: {exc}"
+        # Last resort: never lose the content. Insert the raw text unformatted
+        # so the document still gets the notes even if the styled batch failed.
+        try:
+            index = _document_end_index(document_id)
+            retry_on_transient(lambda: docs_service().documents().batchUpdate(
+                documentId=document_id,
+                body={"requests": [
+                    {"insertText": {"location": {"index": index}, "text": markdown}}
+                ]},
+            ).execute())
+        except HttpError as exc2:
+            return f"Error appending markdown: {exc2}"
+        return (
+            f"Appended {len(markdown)} characters as PLAIN TEXT to {document_id} "
+            f"(markdown formatting skipped after error: {exc})."
+        )
     return f"Appended {len(markdown)} characters of markdown to {document_id}."
 
 

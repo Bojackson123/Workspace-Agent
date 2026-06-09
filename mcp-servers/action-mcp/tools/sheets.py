@@ -13,6 +13,8 @@ from clients import drive as drive_service
 from clients import sheets as sheets_service
 from config import settings
 
+from ._retry import retry_on_transient
+
 # Use USER_ENTERED so the Sheets value parser interprets formulas, dates,
 # and numbers the same way a human typing into the UI would.
 _VALUE_INPUT_OPTION: Final = "USER_ENTERED"
@@ -81,12 +83,12 @@ def write_range(
             numbers, or formula strings (``"=SUM(A1:A10)"``).
     """
     try:
-        response = sheets_service().spreadsheets().values().update(
+        response = retry_on_transient(lambda: sheets_service().spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=range_a1,
             valueInputOption=_VALUE_INPUT_OPTION,
             body={"values": values},
-        ).execute()
+        ).execute())
     except HttpError as exc:
         return f"Error writing range: {exc}"
     return (
@@ -106,13 +108,13 @@ def append_rows(
     write happens at the first empty row beneath the existing data.
     """
     try:
-        response = sheets_service().spreadsheets().values().append(
+        response = retry_on_transient(lambda: sheets_service().spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
             range=range_a1,
             valueInputOption=_VALUE_INPUT_OPTION,
             insertDataOption="INSERT_ROWS",
             body={"values": values},
-        ).execute()
+        ).execute())
     except HttpError as exc:
         return f"Error appending rows: {exc}"
     updates = response.get("updates", {})

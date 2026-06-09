@@ -28,7 +28,11 @@ credentials live on a different server with different scopes.
 
 See [`Docs/Architecture.md`](Docs/Architecture.md) for the full
 architecture, cloud-resource layout, IAM roles, and reproducible setup
-steps.
+steps. For "how it flows" Mermaid diagrams, see
+[`Docs/Workflow-Engine.md`](Docs/Workflow-Engine.md) (dispatch,
+authorization, background tasks, sessions) and
+[`Docs/Meeting-Workflow.md`](Docs/Meeting-Workflow.md) (the `/meeting`
+pipeline with its gate and suspend/resume card flow).
 
 ## Repository layout
 
@@ -39,14 +43,17 @@ steps.
 │   ├── security.py          Google Chat OIDC token verification
 │   ├── chat.py              Chat event → workflow dispatch → reply envelope
 │   ├── agent.py             LlmAgent factory (workflow-scoped toolsets)
-│   ├── workflows/           Slash-command registry (one file per workflow)
+│   ├── workflows/           Slash-command registry (one module/package per workflow)
 │   │   ├── __init__.py      Explicit dispatch list + lookups
 │   │   ├── _base.py         Workflow dataclass, AccessMode, reserved IDs
 │   │   ├── _helpers.py      llm_workflow() helper for single-LlmAgent flows
 │   │   ├── _default.py      DEFAULT_WORKFLOW (free-form fallback)
 │   │   ├── research.py      /research — single LlmAgent on Context MCP
 │   │   ├── draft.py         /draft — single LlmAgent on Action MCP
-│   │   └── sequential_report.py   /report — SequentialAgent example
+│   │   ├── sequential_report.py   /report — SequentialAgent example
+│   │   ├── meeting_engine/  /meeting — gate + suspend/resume card pipeline
+│   │   ├── review_board/    /review — adversarial critic LoopAgent pipeline
+│   │   └── common/          Shared building blocks (gate, grounding, loop_exit)
 │   ├── access.py            Email / domain / Google-Group authorization
 │   ├── access_store.py      DB-backed access-rule store
 │   ├── sessions.py          Thread-keyed multi-turn session store
@@ -71,7 +78,9 @@ steps.
 │       └── Dockerfile
 │
 └── Docs/
-    └── Architecture.md      Full architecture + cloud setup + IAM
+    ├── Architecture.md      Full architecture + cloud setup + IAM
+    ├── Workflow-Engine.md   Engine flowcharts (dispatch, auth, sessions)
+    └── Meeting-Workflow.md  /meeting pipeline flowcharts (gate + cards)
 ```
 
 ## Quick start (local)
@@ -141,7 +150,7 @@ from workflows._base import AccessMode, ToolsetKind
 from workflows._helpers import llm_workflow
 
 WORKFLOW = llm_workflow(
-    command_id=4,
+    command_id=6,
     command_name="/audit",
     description="...",
     instruction="...",
@@ -192,6 +201,8 @@ invoke them. The full ID list to register:
 | 1                        | `/research`     |
 | 2                        | `/draft`        |
 | 3                        | `/report`       |
+| 4                        | `/meeting`      |
+| 5                        | `/review`       |
 | 995                      | `/list-access`  |
 | 996                      | `/revoke`       |
 | 997                      | `/grant`        |

@@ -197,6 +197,12 @@ surface.
 
 ### Workflow engine
 
+> **See also:** [`Workflow-Engine.md`](./Workflow-Engine.md) draws this
+> section out as Mermaid flowcharts (request lifecycle, dispatch decision
+> tree, the two background paths, registry/agent build, access control, and
+> session lifecycle). [`Meeting-Workflow.md`](./Meeting-Workflow.md) does the
+> same for the `/meeting` pipeline.
+
 A single Chat app exposes multiple slash commands, each driving a
 different workflow. The dispatcher itself is tiny — it looks up a
 `Workflow` by `command_id`, asks it to build an ADK agent for the
@@ -814,6 +820,8 @@ match the integer the backend dispatches on:
 | 1 | `/research` | Summarise findings from your personal Workspace data. |
 | 2 | `/draft` | Create or update a document on the Shared Drive. |
 | 3 | `/report` | Research → draft pipeline (`SequentialAgent` example). |
+| 4 | `/meeting` | Parse a meeting transcript into follow-up drafts, calendar holds, tracker rows, and notes (gate + suspend/resume card). |
+| 5 | `/review` | Fill a document template from sources, run an adversarial critic loop, and produce a reviewed draft. |
 | 995 | `/list-access` | Show access rules for a command (admins only). |
 | 996 | `/revoke` | Remove an access rule (admins only). |
 | 997 | `/grant` | Add an access rule (admins only). |
