@@ -30,13 +30,14 @@ from collections.abc import AsyncGenerator
 from google.adk.agents import BaseAgent, LlmAgent, SequentialAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.readonly_context import ReadonlyContext
-from google.adk.events import Event, EventActions
-from google.genai import types
+from google.adk.events import Event
 
 from agent import action_toolset, context_toolset, gemini_model
 from config import settings
 from mcp_client import call_context_tool
 from workflows._base import AccessMode, Workflow
+from workflows.common.conditional import GuardAgent
+from workflows.common.events import model_event
 from workflows.common.gate import GateAgent, GateVerdict
 from workflows.common.state_keys import (
     MTG_ASSEMBLY_STATUS,
@@ -184,73 +185,24 @@ URL, notes URL, any items marked UNASSIGNED/TBD), then end with the exact line:
 """
 
 
-class ConditionalParserAgent(BaseAgent):
-    """Pure-Python guard: passthrough on re-runs, LLM parse on first run.
+def _meeting_already_parsed(state: dict) -> bool:
+    """True on a re-run where MTG_PARSED is already in state.
 
-    When ``MTG_PARSED`` is already in session state (e.g. after the owner-
-    assignment card is submitted and the card handler patched the state), this
-    agent re-emits the stored value directly via ``state_delta`` without
-    invoking the LLM.  This prevents the LLM from drawing on conversation
-    history (where owners were null) and overwriting the card handler's patch.
-
-    On the first invocation (``MTG_PARSED`` absent) it delegates to the inner
-    ``LlmAgent`` sub-agent which fetches and parses the transcript normally.
+    On the owner-card resume the handler patched ``MTG_PARSED`` in place; the
+    parser guard re-emits that stored value so the LLM can't redraw owners from
+    the (null-owner) parse still in conversation history.
     """
-
-    async def _run_async_impl(
-        self, ctx: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-        current = ctx.session.state.get(MTG_PARSED)
-        if current is not None:
-            yield Event(
-                author=self.name,
-                actions=EventActions(state_delta={MTG_PARSED: current}),
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Meeting already parsed — using stored result.")],
-                ),
-            )
-            return
-        # First run: delegate to the inner LlmAgent.
-        # Use run_async (not _run_async_impl) so the ADK framework updates
-        # ctx.agent to the LlmAgent before entering the LLM flow; the flow
-        # reads ctx.agent.tools and ctx.agent.canonical_model and would fail
-        # if it still sees ConditionalParserAgent there.
-        async for event in self.sub_agents[0].run_async(ctx):
-            yield event
+    return state.get(MTG_PARSED) is not None
 
 
-class ConditionalFanOutAgent(BaseAgent):
-    """Skip the fan-out when the owner gate is still pending.
+def _owner_gate_pending(state: dict) -> bool:
+    """True while the owner-assignment card is awaiting submission.
 
-    ``OwnerAssignmentGate`` sets ``MTG_OWNER_GATE_STATE = "PENDING"`` but
-    cannot stop the ``SequentialAgent`` — it just yields an event and returns.
-    Without this guard the fan-out would run on the first pass (before the
-    card is submitted) and produce artefacts for action items that still have
-    null owners/due-dates.
-
-    The deterministic artefacts (drafts/holds/rows) recompute from the patched
-    ``MTG_PARSED`` on every run, so a stale pass would be harmless for them —
-    but the ``notes_writer`` is still an LLM, and skipping it on the PENDING
-    pass keeps its (correct) output the only notes draft in conversation
-    history. So the wrapped sequence still runs exactly once, on the run where
-    all data is complete.
+    The deterministic artefacts recompute from the patched parse on every run,
+    so a stale pass would be harmless for them — but the LLM ``notes_writer``
+    must not run before owners are assigned, so the whole fan-out is skipped.
     """
-
-    async def _run_async_impl(
-        self, ctx: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-        if ctx.session.state.get(MTG_OWNER_GATE_STATE) == "PENDING":
-            yield Event(
-                author=self.name,
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Owner gate pending — skipping fan-out.")],
-                ),
-            )
-            return
-        async for event in self.sub_agents[0].run_async(ctx):
-            yield event
+    return state.get(MTG_OWNER_GATE_STATE) == "PENDING"
 
 
 class OwnerAssignmentGate(BaseAgent):
@@ -271,13 +223,7 @@ class OwnerAssignmentGate(BaseAgent):
         state = ctx.session.state
 
         if state.get(MTG_OWNER_GATE_STATE) == "RESOLVED":
-            yield Event(
-                author=self.name,
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Owner gate: RESOLVED — continuing to assembler.")],
-                ),
-            )
+            yield model_event(self.name, "Owner gate: RESOLVED — continuing to assembler.")
             return
 
         needs_card = False
@@ -293,21 +239,14 @@ class OwnerAssignmentGate(BaseAgent):
                 pass
 
         if needs_card:
-            yield Event(
-                author=self.name,
-                actions=EventActions(state_delta={MTG_OWNER_GATE_STATE: "PENDING"}),
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Owner gate: PENDING — card form will be posted.")],
-                ),
+            yield model_event(
+                self.name,
+                "Owner gate: PENDING — card form will be posted.",
+                **{MTG_OWNER_GATE_STATE: "PENDING"},
             )
         else:
-            yield Event(
-                author=self.name,
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Owner gate: all action items have owners — continuing.")],
-                ),
+            yield model_event(
+                self.name, "Owner gate: all action items have owners — continuing."
             )
 
 
@@ -329,13 +268,7 @@ class MeetingFanOutAgent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         parsed_data = ctx.session.state.get(MTG_PARSED)
         if not parsed_data:
-            yield Event(
-                author=self.name,
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Fan-out skipped: no parsed meeting in state.")],
-                ),
-            )
+            yield model_event(self.name, "Fan-out skipped: no parsed meeting in state.")
             return
 
         parsed = ParsedMeeting.model_validate(parsed_data)
@@ -350,14 +283,14 @@ class MeetingFanOutAgent(BaseAgent):
             f"CALENDAR_HOLDS ({MTG_CALENDAR_HOLDS}):\n{json.dumps(holds, ensure_ascii=False)}\n\n"
             f"TRACKER_ROWS ({MTG_TRACKER_ROWS}):\n{json.dumps(rows, ensure_ascii=False)}"
         )
-        yield Event(
-            author=self.name,
-            actions=EventActions(state_delta={
+        yield model_event(
+            self.name,
+            summary,
+            **{
                 MTG_EMAIL_DRAFTS: drafts,
                 MTG_CALENDAR_HOLDS: holds,
                 MTG_TRACKER_ROWS: rows,
-            }),
-            content=types.Content(role="model", parts=[types.Part(text=summary)]),
+            },
         )
 
 
@@ -377,8 +310,8 @@ class CalendarCreatorAgent(BaseAgent):
     Guards so the side effect happens exactly once and never on a blocked run:
     skips on a hard gate failure (no events for a structurally-invalid meeting)
     and on re-runs once the event-id map already exists (idempotent). The PENDING
-    pass never reaches here — ``ConditionalFanOutAgent`` skips the whole
-    sequence — but it's checked defensively too.
+    pass never reaches here — the fan-out guard skips the whole sequence — but
+    it's checked defensively too.
     """
 
     user_email: str
@@ -390,22 +323,10 @@ class CalendarCreatorAgent(BaseAgent):
         if state.get(MTG_OWNER_GATE_STATE) == "PENDING":
             return
         if state.get(MTG_GATE_FAILED):
-            yield Event(
-                author=self.name,
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Calendar creation skipped: gate failed.")],
-                ),
-            )
+            yield model_event(self.name, "Calendar creation skipped: gate failed.")
             return
         if state.get(MTG_CALENDAR_EVENT_IDS):
-            yield Event(
-                author=self.name,
-                content=types.Content(
-                    role="model",
-                    parts=[types.Part(text="Calendar reminders already created — skipping.")],
-                ),
-            )
+            yield model_event(self.name, "Calendar reminders already created — skipping.")
             return
 
         holds = state.get(MTG_CALENDAR_HOLDS) or []
@@ -440,10 +361,8 @@ class CalendarCreatorAgent(BaseAgent):
         summary = f"Created {len(event_ids)} calendar reminder(s) on your calendar."
         if errors:
             summary += " Some failed: " + "; ".join(errors)
-        yield Event(
-            author=self.name,
-            actions=EventActions(state_delta={MTG_CALENDAR_EVENT_IDS: event_ids}),
-            content=types.Content(role="model", parts=[types.Part(text=summary)]),
+        yield model_event(
+            self.name, summary, **{MTG_CALENDAR_EVENT_IDS: event_ids}
         )
 
 
@@ -475,9 +394,12 @@ async def _build(user_email: str) -> SequentialAgent:
         output_schema=ParsedMeeting,
         output_key=MTG_PARSED,
     )
-    parser = ConditionalParserAgent(
+    parser = GuardAgent(
         name="meeting_parser",
-        sub_agents=[_parser_llm],
+        skip_when=_meeting_already_parsed,
+        skip_text="Meeting already parsed — using stored result.",
+        sub_agent=_parser_llm,
+        restore_key=MTG_PARSED,
     )
 
     # Email drafts, calendar holds, and tracker rows are mechanical mappings
@@ -505,9 +427,11 @@ async def _build(user_email: str) -> SequentialAgent:
         name="meeting_fan_out",
         sub_agents=[fan_out_compute, calendar_creator, notes_writer],
     )
-    fan_out = ConditionalFanOutAgent(
+    fan_out = GuardAgent(
         name="meeting_conditional_fan_out",
-        sub_agents=[_fan_out_seq],
+        skip_when=_owner_gate_pending,
+        skip_text="Owner gate pending — skipping fan-out.",
+        sub_agent=_fan_out_seq,
     )
 
     gate = GateAgent(

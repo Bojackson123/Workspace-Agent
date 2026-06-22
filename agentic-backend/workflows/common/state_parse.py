@@ -44,3 +44,22 @@ def coerce_model_list(
         except Exception:  # noqa: BLE001 — tolerate partial/garbled entries
             continue
     return out
+
+
+def coerce_model(raw: object, model_cls: type[ModelT]) -> ModelT | None:
+    """Parse a dict or JSON string into a single *model_cls*; ``None`` on failure.
+
+    Returns ``None`` for both absent/empty input and unparseable input, so a
+    caller that must distinguish "no value" from "bad value" should test for
+    presence before calling.
+    """
+    if not raw:
+        return None
+    try:
+        if isinstance(raw, dict):
+            return model_cls.model_validate(raw)
+        if isinstance(raw, str):
+            return model_cls.model_validate_json(raw)
+    except Exception:  # noqa: BLE001 — caller decides what a parse failure means
+        return None
+    return None

@@ -43,6 +43,7 @@ from agent import action_toolset, gemini_model
 from config import settings
 from mcp_client import call_action_tool
 from workflows._base import AccessMode, Workflow
+from workflows.common.conditional import GuardAgent
 from workflows.common.events import model_event
 from workflows.common.state_keys import (
     IQ_ASSEMBLY_STATUS,
@@ -219,24 +220,9 @@ class IQTailorGate(BaseAgent):
         )
 
 
-class ConditionalLlmAgent(BaseAgent):
-    """Run the wrapped LLM stage only once the tailoring form is resolved.
-
-    Mirrors the RFI engine's conditional wrappers: while the gate is ``PENDING``
-    the inner ``LlmAgent`` is skipped so no research/structuring happens before
-    the user has tailored the run.
-    """
-
-    async def _run_async_impl(
-        self, ctx: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-        if ctx.session.state.get(IQ_TAILOR_STATE) == "PENDING":
-            yield model_event(
-                self.name, f"{self.name}: skipped — awaiting the tailoring form."
-            )
-            return
-        async for event in self.sub_agents[0].run_async(ctx):
-            yield event
+def _tailoring_pending(state: dict) -> bool:
+    """True while the tailoring form is awaiting submission (skip the LLM stages)."""
+    return state.get(IQ_TAILOR_STATE) == "PENDING"
 
 
 # ── Assembler (deterministic) ───────────────────────────────────────────────
@@ -423,8 +409,18 @@ async def _build(user_email: str) -> SequentialAgent:
         name="iq_pipeline",
         sub_agents=[
             IQTailorGate(name="iq_tailor_gate"),
-            ConditionalLlmAgent(name="iq_research_gate", sub_agents=[research]),
-            ConditionalLlmAgent(name="iq_structurer_gate", sub_agents=[structurer]),
+            GuardAgent(
+                name="iq_research_gate",
+                skip_when=_tailoring_pending,
+                skip_text="iq_research_gate: skipped — awaiting the tailoring form.",
+                sub_agent=research,
+            ),
+            GuardAgent(
+                name="iq_structurer_gate",
+                skip_when=_tailoring_pending,
+                skip_text="iq_structurer_gate: skipped — awaiting the tailoring form.",
+                sub_agent=structurer,
+            ),
             assembler,
         ],
     )

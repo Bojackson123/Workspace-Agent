@@ -40,6 +40,7 @@ from google.genai import types
 from agent import action_toolset, gemini_model
 from mcp_client import MCP_WRITE_TIMEOUT_S, call_action_tool
 from workflows._base import AccessMode, Workflow
+from workflows.common.conditional import GuardAgent
 from workflows.common.events import model_event
 from workflows.common.gate import GateAgent
 from workflows.common.state_keys import (
@@ -124,30 +125,17 @@ def _parser_instruction(ctx: ReadonlyContext) -> str:
     return f"{_PARSER_INSTRUCTION}\n\nfile_id: {file_id}\n"
 
 
-class ConditionalParserAgent(BaseAgent):
-    """Run the LLM parser once; pass through stored questions on re-runs.
+def _questions_present(state: dict) -> bool:
+    """True on a re-run where the parser already extracted the question set."""
+    return bool(state.get(RFI_QUESTIONS))
 
-    On a card-resume re-run ``RFI_QUESTIONS`` is already in state, so this
-    re-emits it without calling the LLM again — guarding against the parser
-    re-reading the file and overwriting the question set (and its answer
-    anchors) that downstream answers are keyed to.
-    """
 
-    async def _run_async_impl(
-        self, ctx: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-        current = ctx.session.state.get(RFI_QUESTIONS)
-        if current:
-            yield model_event(
-                self.name,
-                "RFI already parsed — using stored questions.",
-                **{RFI_QUESTIONS: current},
-            )
-            return
-        # First run: delegate to the inner LlmAgent (uses run_async so ADK
-        # swaps ctx.agent to the LlmAgent before entering the model flow).
-        async for event in self.sub_agents[0].run_async(ctx):
-            yield event
+def _forms_pending(state: dict) -> bool:
+    """True while either the scope or gap-fill form is awaiting submission."""
+    return (
+        state.get(RFI_GUIDANCE_STATE) == "PENDING"
+        or state.get(RFI_GAP_STATE) == "PENDING"
+    )
 
 
 # ── Guidance gate (deterministic, suspends for Form 1) ──────────────────────
@@ -218,20 +206,6 @@ class GapFillGate(BaseAgent):
 
 
 # ── Assembler (deterministic, guarded) ──────────────────────────────────────
-
-
-class ConditionalAssemblerAgent(BaseAgent):
-    """Run the assembler only when neither form is awaiting submission."""
-
-    async def _run_async_impl(
-        self, ctx: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-        state = ctx.session.state
-        if state.get(RFI_GUIDANCE_STATE) == "PENDING" or state.get(RFI_GAP_STATE) == "PENDING":
-            yield model_event(self.name, "Assembler skipped — awaiting a form submission.")
-            return
-        async for event in self.sub_agents[0].run_async(ctx):
-            yield event
 
 
 class RFIAssembler(BaseAgent):
@@ -345,7 +319,13 @@ async def _build(user_email: str) -> SequentialAgent:
         output_schema=RFIQuestionSet,
         output_key=RFI_QUESTIONS,
     )
-    parser = ConditionalParserAgent(name="rfi_parser", sub_agents=[parser_llm])
+    parser = GuardAgent(
+        name="rfi_parser",
+        skip_when=_questions_present,
+        skip_text="RFI already parsed — using stored questions.",
+        sub_agent=parser_llm,
+        restore_key=RFI_QUESTIONS,
+    )
     guidance_gate = GuidanceGate(name="rfi_guidance_gate")
 
     # Research runs its own per-batch LlmAgents in isolated sessions
@@ -361,9 +341,11 @@ async def _build(user_email: str) -> SequentialAgent:
 
     gap_gate = GapFillGate(name="rfi_gap_gate")
 
-    assembler = ConditionalAssemblerAgent(
+    assembler = GuardAgent(
         name="rfi_conditional_assembler",
-        sub_agents=[RFIAssembler(name="rfi_assembler")],
+        skip_when=_forms_pending,
+        skip_text="Assembler skipped — awaiting a form submission.",
+        sub_agent=RFIAssembler(name="rfi_assembler"),
     )
 
     return SequentialAgent(
