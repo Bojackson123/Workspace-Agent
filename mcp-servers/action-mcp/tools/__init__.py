@@ -7,7 +7,7 @@ is a convenience helper used by ``server.py``.
 
 from mcp.server.fastmcp import FastMCP
 
-from . import docs, drive, sheets
+from . import docs, drive, rfi_files, sheets
 
 
 def register_all(mcp: FastMCP) -> None:
@@ -15,6 +15,7 @@ def register_all(mcp: FastMCP) -> None:
     drive.register(mcp)
     docs.register(mcp)
     sheets.register(mcp)
+    rfi_files.register(mcp)
 
 
-__all__ = ["register_all", "drive", "docs", "sheets"]
+__all__ = ["register_all", "docs", "drive", "rfi_files", "sheets"]

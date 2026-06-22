@@ -25,6 +25,8 @@ bootstrap admins, not by the table they manage — see
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
 import re
@@ -41,7 +43,12 @@ from opentelemetry import trace as otel_trace
 from access import authorize, authorize_bootstrap_admin
 from access_store import AccessStore, VALID_RULE_TYPES
 from agent import build_agent_for_workflow
-from chat_client import post_card_to_space, post_message_to_space, update_card_in_space
+from chat_client import (
+    download_attachment,
+    post_card_to_space,
+    post_message_to_space,
+    update_card_in_space,
+)
 from config import settings
 from sessions import SessionStore, STATE_ACTIVE_WORKFLOW_ID, _session_id_for
 from workflows import (
@@ -59,8 +66,12 @@ from workflows import (
     get_workflow_by_name,
 )
 
-from mcp_client import call_context_tool
+from mcp_client import call_action_tool, call_context_tool
 from workflows.common.state_keys import (
+    IQ_COMPANY_NAME,
+    IQ_TAILOR,
+    IQ_TAILOR_CARD_MSG,
+    IQ_TAILOR_STATE,
     MTG_ASSEMBLY_STATUS,
     MTG_CALENDAR_EVENT_IDS,
     MTG_CALENDAR_HOLDS,
@@ -72,8 +83,30 @@ from workflows.common.state_keys import (
     MTG_OWNER_GATE_STATE,
     MTG_PARSED,
     MTG_TRACKER_ROWS,
+    RFI_ANSWERS,
+    RFI_ASSEMBLY_STATUS,
+    RFI_COMPLETED_MARKER,
+    RFI_FILE_ID,
+    RFI_FILE_NAME,
+    RFI_FILLED_LINK,
+    RFI_GAP_CARD_MSG,
+    RFI_GAP_STATE,
+    RFI_GUIDANCE,
+    RFI_GUIDANCE_CARD_MSG,
+    RFI_GUIDANCE_STATE,
+    RFI_QUESTIONS,
 )
+from workflows.iq_engine.agents import SANMINA_CAPABILITIES
 from workflows.meeting_engine.schemas import ActionItem, ParsedMeeting
+
+# Command id of the RFI workflow — used to branch the slash-workflow runner
+# into the attachment-intake + form-posting path. Kept as a literal to avoid a
+# circular import of the workflow module at chat.py import time.
+_RFI_COMMAND_ID: Final = 6
+
+# Command id of the Customer IQ workflow — branches the runner into the
+# tailoring-form path (post the form first, then run on submit).
+_IQ_COMMAND_ID: Final = 7
 
 log = logging.getLogger(__name__)
 _tracer = otel_trace.get_tracer(__name__)
@@ -108,6 +141,21 @@ _access_store = AccessStore(_session_store.engine)
 
 
 @dataclass(frozen=True, slots=True)
+class Attachment:
+    """A file attached to an inbound Chat message.
+
+    ``resource_name`` identifies uploaded-content attachments (downloadable via
+    the Chat media endpoint); ``drive_file_id`` is set instead when the user
+    attached an existing Google Drive file.
+    """
+
+    content_name: str
+    content_type: str
+    resource_name: str
+    drive_file_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChatEvent:
     """A minimal, well-typed view of an inbound Google Chat payload."""
 
@@ -129,6 +177,8 @@ class ChatEvent:
     # Chat expects in REST calls.
     space_resource: str
     message_thread: str
+    # Files attached to the inbound message (e.g. an RFI .xlsx/.docx).
+    attachments: tuple[Attachment, ...] = ()
 
     @classmethod
     def from_payload(cls, body: dict) -> "ChatEvent":
@@ -159,6 +209,7 @@ class ChatEvent:
             thread_name=thread_name,
             space_resource=space_resource,
             message_thread=message_thread,
+            attachments=_parse_attachments(message),
         )
 
 
@@ -232,6 +283,26 @@ def _clean_prompt(message: dict) -> str:
         _, _, rest = text.partition(" ")
         return rest.lstrip()
     return text
+
+
+def _parse_attachments(message: dict) -> tuple[Attachment, ...]:
+    """Extract attachment metadata from a Chat message payload.
+
+    Chat exposes attachments under ``message.attachment`` (singular key, list
+    value). Uploaded files carry an ``attachmentDataRef.resourceName``;
+    Drive-sourced files carry a ``driveDataRef.driveFileId``.
+    """
+    out: list[Attachment] = []
+    for att in message.get("attachment") or []:
+        data_ref = att.get("attachmentDataRef") or {}
+        drive_ref = att.get("driveDataRef") or {}
+        out.append(Attachment(
+            content_name=att.get("contentName") or "",
+            content_type=att.get("contentType") or "",
+            resource_name=data_ref.get("resourceName") or "",
+            drive_file_id=drive_ref.get("driveFileId") or "",
+        ))
+    return tuple(out)
 
 
 def chat_text(text: str) -> dict[str, str]:
@@ -377,6 +448,7 @@ async def _handle_message(
             user_display=event.user_display,
             prompt=event.prompt,
             space_resource=event.space_resource,
+            attachments=event.attachments,
         )
         return {}
 
@@ -642,6 +714,9 @@ _GENERIC_REPLY_FAILED: Final = (
 _OWNER_ASSIGNMENT_FUNCTION: Final = "owner_assignment"
 _OPEN_INVITE_DIALOG_FUNCTION: Final = "open_invite_dialog"
 _SUBMIT_INVITES_FUNCTION: Final = "submit_invites"
+_RFI_GUIDANCE_FUNCTION: Final = "rfi_guidance_submit"
+_RFI_GAP_FUNCTION: Final = "rfi_gap_submit"
+_IQ_TAILOR_FUNCTION: Final = "iq_tailor_submit"
 
 _STATE_KEYS_TO_RESET_ON_CARD: Final = [
     # Clear fan-out outputs so the LLM agents always start from a blank slate
@@ -890,6 +965,12 @@ async def _handle_card_clicked(
         return await _handle_open_invite_dialog(evt)
     if evt.invoked_function == _SUBMIT_INVITES_FUNCTION:
         return await _handle_submit_invites(evt, background_tasks)
+    if evt.invoked_function == _RFI_GUIDANCE_FUNCTION:
+        return await _handle_rfi_guidance_submit(evt, background_tasks)
+    if evt.invoked_function == _RFI_GAP_FUNCTION:
+        return await _handle_rfi_gap_submit(evt, background_tasks)
+    if evt.invoked_function == _IQ_TAILOR_FUNCTION:
+        return await _handle_iq_tailor_submit(evt, background_tasks)
 
     # Default / legacy: the owner-assignment form.
     raw_form_inputs = evt.form_inputs
@@ -1481,6 +1562,632 @@ async def _apply_invites(
     await post_message_to_space(space_resource, summary, thread_name=thread_name)
 
 
+# ---------------------------------------------------------------------------
+# RFI Response Engine — attachment intake, scope/gap forms, resume
+# ---------------------------------------------------------------------------
+
+_XLSX_MIME: Final = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_DOCX_MIME: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# Downstream state cleared whenever an RFI form is submitted, so the re-run
+# regenerates from the patched inputs instead of reusing stale values.
+_RFI_KEYS_TO_RESET_ON_GUIDANCE: Final = [
+    RFI_ANSWERS, RFI_GAP_STATE, RFI_FILLED_LINK,
+]
+
+
+def _is_rfi_attachment(att: Attachment) -> bool:
+    name = att.content_name.lower()
+    ctype = att.content_type or ""
+    return (
+        name.endswith(".xlsx") or name.endswith(".docx")
+        or "spreadsheet" in ctype or "wordprocessing" in ctype
+    )
+
+
+def _guess_mime(name: str) -> str:
+    return _DOCX_MIME if name.lower().endswith(".docx") else _XLSX_MIME
+
+
+def _form_text(form_inputs: dict, key: str) -> str:
+    """Read a single text value from a form input by widget name."""
+    inp = form_inputs.get(key) or {}
+    vals = (inp.get("stringInputs") or {}).get("value") or []
+    return (vals[0] if vals else "").strip()
+
+
+def _form_values(form_inputs: dict, key: str) -> list[str]:
+    """Read every selected value from a multi-select form input by widget name."""
+    inp = form_inputs.get(key) or {}
+    vals = (inp.get("stringInputs") or {}).get("value") or []
+    return [v.strip() for v in vals if isinstance(v, str) and v.strip()]
+
+
+async def _append_state(session: Any, delta: dict[str, Any]) -> None:
+    """Persist a state delta onto *session* via an ADK event (best effort)."""
+    try:
+        await _session_store.service.append_event(
+            session, Event(author="rfi", actions=EventActions(state_delta=delta))
+        )
+    except Exception:
+        log.exception("rfi: failed to persist state delta %s", list(delta.keys()))
+
+
+async def _prepare_rfi_file(
+    *, attachments: tuple[Attachment, ...], session: Any
+) -> str | None:
+    """Download the attached RFI, store it on the Shared Drive, seed state.
+
+    Returns ``None`` on success or a user-facing error string to post.
+    """
+    if not attachments:
+        return (
+            "Please attach the RFI as an .xlsx or .docx file and run `/rfi` again."
+        )
+    rfi_atts = [a for a in attachments if _is_rfi_attachment(a)]
+    att = rfi_atts[0] if rfi_atts else attachments[0]
+    if not att.resource_name:
+        return (
+            "I can only read files attached directly to the message. Download the "
+            "RFI to your device and attach it to `/rfi` rather than linking it."
+        )
+
+    data = await download_attachment(att.resource_name)
+    if not data:
+        return "I couldn't download the attached file. Please try attaching it again."
+
+    content_b64 = base64.b64encode(data).decode("ascii")
+    mime = att.content_type or _guess_mime(att.content_name)
+    try:
+        result = await call_action_tool("upload_binary_file", {
+            "name": att.content_name or "rfi-upload.xlsx",
+            "mime_type": mime,
+            "content_b64": content_b64,
+        })
+        parsed = json.loads(result)
+    except Exception:
+        log.exception("rfi.prepare: upload_binary_file failed")
+        return "I couldn't store the RFI file for processing. Please try again."
+
+    if parsed.get("error") or not parsed.get("file_id"):
+        return f"I couldn't store the RFI file: {parsed.get('error', 'unknown error')}"
+
+    await _append_state(session, {
+        RFI_FILE_ID: parsed["file_id"],
+        RFI_FILE_NAME: parsed.get("name") or att.content_name,
+    })
+    return None
+
+
+def _build_rfi_guidance_card(
+    n_questions: int, file_name: str, invoker_email: str
+) -> dict:
+    """Form 1 — collect scope guidance to steer the research."""
+    fields = [
+        ("facilities", "Target facilities / sites", "e.g. Guadalajara, Penang"),
+        ("segment", "Business segment", "e.g. Medical, Defense & Aerospace, Cloud"),
+        ("customer", "Prospective customer", "Customer or company name"),
+        ("industry", "Customer industry", "e.g. Medical devices, Automotive"),
+    ]
+    widgets: list[dict] = [
+        {"textInput": {"name": name, "label": label, "hintText": hint, "type": "SINGLE_LINE"}}
+        for name, label, hint in fields
+    ]
+    widgets.append({"buttonList": {"buttons": [{
+        "text": "Start research",
+        "onClick": {"action": {
+            "function": _RFI_GUIDANCE_FUNCTION,
+            "parameters": [{"key": "invoker_email", "value": invoker_email}],
+        }},
+    }]}})
+    return {"cardsV2": [{
+        "cardId": "rfi_guidance",
+        "card": {
+            "header": {
+                "title": "Guide the RFI research",
+                "subtitle": f"{n_questions} question(s) from {file_name}",
+            },
+            "sections": [{"widgets": widgets}],
+        },
+    }]}
+
+
+def _build_rfi_gap_card(
+    gap_items: list[tuple[str, str]], invoker_email: str
+) -> dict:
+    """Form 2 — one input per question research couldn't answer confidently."""
+    sections: list[dict] = []
+    for qid, text in gap_items[:20]:
+        sections.append({
+            "header": qid,
+            "widgets": [
+                {"textParagraph": {"text": text}},
+                {"textInput": {"name": f"ans::{qid}", "label": "Your answer", "type": "MULTIPLE_LINE"}},
+            ],
+        })
+    sections.append({"widgets": [{"buttonList": {"buttons": [{
+        "text": "Submit answers",
+        "onClick": {"action": {
+            "function": _RFI_GAP_FUNCTION,
+            "parameters": [{"key": "invoker_email", "value": invoker_email}],
+        }},
+    }]}}]})
+    n = len(gap_items)
+    return {"cardsV2": [{
+        "cardId": "rfi_gap",
+        "card": {
+            "header": {
+                "title": f"{n} question{'s' if n != 1 else ''} need your input",
+                "subtitle": "Fill in what the research couldn't answer",
+            },
+            "sections": sections,
+        },
+    }]}
+
+
+def _rfi_questions(state: dict) -> list[dict]:
+    """Unwrap RFI_QUESTIONS (an ``RFIQuestionSet`` dict) into a list of dicts."""
+    raw = state.get(RFI_QUESTIONS) or []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(raw, dict):
+        raw = raw.get("questions", [])
+    return raw if isinstance(raw, list) else []
+
+
+def _rfi_gap_items(state: dict) -> list[tuple[str, str]]:
+    """Return ``(question_id, question_text)`` for every needs_human answer."""
+    text_by_id = {
+        q.get("id"): q.get("text", "")
+        for q in _rfi_questions(state)
+    }
+    answers_raw = state.get(RFI_ANSWERS) or {}
+    if isinstance(answers_raw, str):
+        try:
+            answers_raw = json.loads(answers_raw)
+        except json.JSONDecodeError:
+            answers_raw = {}
+    answers = answers_raw.get("answers", []) if isinstance(answers_raw, dict) else answers_raw
+    items: list[tuple[str, str]] = []
+    for a in answers or []:
+        if isinstance(a, dict) and a.get("needs_human"):
+            qid = a.get("question_id", "")
+            items.append((qid, text_by_id.get(qid, qid)))
+    return items
+
+
+async def _post_rfi_result(
+    *,
+    space_resource: str,
+    thread_name: str,
+    user_email: str,
+    session_id: str,
+    reply: str,
+) -> None:
+    """Post the next RFI form (scope / gap) or the final reply, by state."""
+    cfg = settings()
+    session = await _session_store.service.get_session(
+        app_name=cfg.app_name, user_id=user_email, session_id=session_id,
+    )
+    state = session.state if session else {}
+
+    if state.get(RFI_GUIDANCE_STATE) == "PENDING":
+        card = _build_rfi_guidance_card(
+            len(_rfi_questions(state)),
+            state.get(RFI_FILE_NAME) or "your RFI",
+            user_email,
+        )
+        msg = await post_card_to_space(space_resource, card, thread_name=thread_name)
+        if msg and session:
+            await _append_state(session, {RFI_GUIDANCE_CARD_MSG: msg})
+        return
+
+    if state.get(RFI_GAP_STATE) == "PENDING":
+        gaps = _rfi_gap_items(state)
+        card = _build_rfi_gap_card(gaps, user_email)
+        msg = await post_card_to_space(space_resource, card, thread_name=thread_name)
+        if msg and session:
+            await _append_state(session, {RFI_GAP_CARD_MSG: msg})
+        return
+
+    text = _markdown_to_chat(reply) if reply else "I wasn't able to complete the RFI workflow."
+    await post_message_to_space(space_resource, text, thread_name=thread_name)
+
+
+async def _handle_rfi_guidance_submit(
+    evt: CardClickedEvent, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    """Apply Form 1 scope guidance and re-run the RFI pipeline."""
+    if not evt.invoker_email or not evt.thread_name:
+        return {}
+    cfg = settings()
+    session_id = _session_id_for(evt.thread_name)
+    session = await _session_store.service.get_session(
+        app_name=cfg.app_name, user_id=evt.invoker_email, session_id=session_id,
+    )
+    if session is None:
+        return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(
+            "This form has expired. Run `/rfi` again to start fresh."
+        )}
+    if session.state.get(RFI_GUIDANCE_STATE) != "PENDING":
+        return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(
+            "Already processed."
+        )}
+
+    guidance = {
+        "facilities": _form_text(evt.form_inputs, "facilities"),
+        "segment": _form_text(evt.form_inputs, "segment"),
+        "customer": _form_text(evt.form_inputs, "customer"),
+        "industry": _form_text(evt.form_inputs, "industry"),
+    }
+    state_patch: dict[str, Any] = {RFI_GUIDANCE: guidance, RFI_GUIDANCE_STATE: "RESOLVED"}
+    for key in _RFI_KEYS_TO_RESET_ON_GUIDANCE:
+        state_patch[key] = None
+    await _append_state(session, state_patch)
+
+    workflow = _workflow_for(session.state.get(STATE_ACTIVE_WORKFLOW_ID))
+    background_tasks.add_task(
+        _resume_rfi_after_card,
+        workflow=workflow,
+        invoker_email=evt.invoker_email,
+        space_resource=evt.space_resource,
+        thread_name=evt.thread_name,
+        session_id=session_id,
+    )
+    return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(
+        "Got it — researching answers now. I'll follow up here."
+    )}
+
+
+async def _handle_rfi_gap_submit(
+    evt: CardClickedEvent, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    """Merge Form 2 human answers and re-run the RFI pipeline to assemble."""
+    if not evt.invoker_email or not evt.thread_name:
+        return {}
+    cfg = settings()
+    session_id = _session_id_for(evt.thread_name)
+    session = await _session_store.service.get_session(
+        app_name=cfg.app_name, user_id=evt.invoker_email, session_id=session_id,
+    )
+    if session is None:
+        return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(
+            "This form has expired. Run `/rfi` again to start fresh."
+        )}
+    if session.state.get(RFI_GAP_STATE) != "PENDING":
+        return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(
+            "Already processed."
+        )}
+
+    # Parse ans::<qid> inputs into {qid: text}.
+    submitted: dict[str, str] = {}
+    for key, inp in evt.form_inputs.items():
+        if "::" not in key or not isinstance(inp, dict):
+            continue
+        _field, qid = key.split("::", 1)
+        vals = (inp.get("stringInputs") or {}).get("value") or []
+        if vals and vals[0].strip():
+            submitted[qid] = vals[0].strip()
+
+    answers_raw = session.state.get(RFI_ANSWERS) or {}
+    if isinstance(answers_raw, str):
+        try:
+            answers_raw = json.loads(answers_raw)
+        except json.JSONDecodeError:
+            answers_raw = {}
+    answers = answers_raw.get("answers", []) if isinstance(answers_raw, dict) else (answers_raw or [])
+    for a in answers:
+        if isinstance(a, dict) and a.get("question_id") in submitted:
+            a["answer"] = submitted[a["question_id"]]
+            a["needs_human"] = False
+
+    state_patch: dict[str, Any] = {
+        RFI_ANSWERS: {"answers": answers},
+        RFI_GAP_STATE: "RESOLVED",
+    }
+    await _append_state(session, state_patch)
+
+    workflow = _workflow_for(session.state.get(STATE_ACTIVE_WORKFLOW_ID))
+    background_tasks.add_task(
+        _resume_rfi_after_card,
+        workflow=workflow,
+        invoker_email=evt.invoker_email,
+        space_resource=evt.space_resource,
+        thread_name=evt.thread_name,
+        session_id=session_id,
+    )
+    return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(
+        "Thanks — filling in your answers and finishing the response file."
+    )}
+
+
+# Bounded auto-resume when the final fill fails transiently. The assembler and
+# fill_rfi_answers are both idempotent, so re-running the (now research-free)
+# pipeline only completes the write — it can't duplicate work or files.
+_RFI_RESUME_ATTEMPTS: Final = 3
+_RFI_RESUME_BACKOFF_S: Final = 3.0
+_RFI_RESUME_EXHAUSTED_HINT: Final = (
+    "⚠️ I couldn't finish writing the response file just now. Your answers are "
+    "saved — reply anything in this thread and I'll pick up where it left off."
+)
+
+
+def _rfi_assembly_failed(state: dict) -> bool:
+    """True if the run should have produced the filled file but didn't.
+
+    Distinguishes a genuine assembler failure (worth retrying) from a legitimate
+    suspension: returns False while either form is still pending (the run is
+    meant to stop there) and False once the response file is written.
+    """
+    if not _rfi_questions(state):
+        return False  # nothing to assemble — not a retryable state
+    if state.get(RFI_GUIDANCE_STATE) == "PENDING":
+        return False
+    if state.get(RFI_GAP_STATE) == "PENDING":
+        return False
+    return RFI_COMPLETED_MARKER not in (state.get(RFI_ASSEMBLY_STATUS) or "")
+
+
+async def _resume_rfi_after_card(
+    *,
+    workflow: Workflow,
+    invoker_email: str,
+    space_resource: str,
+    thread_name: str,
+    session_id: str,
+) -> None:
+    """Background task: re-run the RFI pipeline after a form submission.
+
+    The submitted answers are already persisted, and both the assembler and
+    ``fill_rfi_answers`` are idempotent, so a transient failure on the final
+    write is retried by re-running the (research-free) pipeline a few times. On
+    persistent failure the user is told that any reply in this thread retries —
+    that path re-runs the same idempotent pipeline.
+    """
+    cfg = settings()
+    reply = ""
+    for attempt in range(_RFI_RESUME_ATTEMPTS):
+        try:
+            reply = await _run_agent(
+                workflow=workflow,
+                user_email=invoker_email,
+                session_id=session_id,
+                prompt="(RFI form submitted via card — please continue the workflow)",
+            )
+        except Exception:
+            log.exception(
+                "RFI card resume failed (attempt %d/%d): workflow=%s user=%s",
+                attempt + 1, _RFI_RESUME_ATTEMPTS, workflow.command_name, invoker_email,
+            )
+            reply = ""
+
+        session = await _session_store.service.get_session(
+            app_name=cfg.app_name, user_id=invoker_email, session_id=session_id,
+        )
+        if not _rfi_assembly_failed(session.state if session else {}):
+            break  # completed, or legitimately suspended at the next form
+        if attempt < _RFI_RESUME_ATTEMPTS - 1:
+            await asyncio.sleep(_RFI_RESUME_BACKOFF_S * (attempt + 1))
+    else:
+        # Exhausted every attempt with the write still pending.
+        reply = (f"{reply}\n\n" if reply else "") + _RFI_RESUME_EXHAUSTED_HINT
+
+    await _post_rfi_result(
+        space_resource=space_resource,
+        thread_name=thread_name,
+        user_email=invoker_email,
+        session_id=session_id,
+        reply=reply,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Customer IQ tailoring form — seeding, builder, handler, resume task
+# ---------------------------------------------------------------------------
+
+
+async def _prepare_iq(*, prompt: str, session: Any) -> str | None:
+    """Seed ``IQ_COMPANY_NAME`` from the slash prompt before the pipeline runs.
+
+    Returns ``None`` on success or a user-facing error string to post. The
+    company must live in state because the resume run (after the form) carries a
+    generic prompt, not the company name.
+    """
+    company = (prompt or "").strip()
+    if not company:
+        return "Tell me which company to profile, e.g. `/iq Acme Corp`."
+    await _append_state(session, {IQ_COMPANY_NAME: company})
+    return None
+
+
+def _build_iq_tailor_card(company: str, invoker_email: str) -> dict:
+    """Optional tailoring form posted as the first response to ``/iq``.
+
+    Every lever is optional; the "Skip — use defaults" button resolves the gate
+    with empty tailoring so the run reproduces the pre-form behaviour.
+    """
+    segment_items = [
+        {"text": label, "value": value} for value, label in SANMINA_CAPABILITIES
+    ]
+    purpose_items = [
+        {"text": "General (default)", "value": "general", "selected": True},
+        {"text": "Cold outreach prep", "value": "cold_outreach"},
+        {"text": "QBR / account-review prep", "value": "qbr"},
+        {"text": "Executive briefing", "value": "exec_briefing"},
+    ]
+    source_items = [
+        {"text": "Shared Drive + web (default)", "value": "drive_web", "selected": True},
+        {"text": "Web only", "value": "web_only"},
+        {"text": "Shared Drive only", "value": "drive_only"},
+    ]
+    widgets: list[dict] = [
+        {"selectionInput": {
+            "name": "segments",
+            "label": "Segment lens — capabilities to score fit against (optional)",
+            "type": "CHECK_BOX",
+            "items": segment_items,
+        }},
+        {"textInput": {
+            "name": "context",
+            "label": "What you already know (optional)",
+            "hintText": "e.g. met their VP Ops at a trade show; standing up a Texas plant",
+            "type": "MULTIPLE_LINE",
+        }},
+        {"selectionInput": {
+            "name": "purpose",
+            "label": "Purpose / audience",
+            "type": "DROPDOWN",
+            "items": purpose_items,
+        }},
+        {"textInput": {
+            "name": "geo",
+            "label": "Geographic focus (optional)",
+            "hintText": "e.g. North America, EMEA, Penang",
+            "type": "SINGLE_LINE",
+        }},
+        {"selectionInput": {
+            "name": "sources",
+            "label": "Data sources",
+            "type": "DROPDOWN",
+            "items": source_items,
+        }},
+        {"buttonList": {"buttons": [
+            {"text": "Generate dossier", "onClick": {"action": {
+                "function": _IQ_TAILOR_FUNCTION,
+                "parameters": [
+                    {"key": "invoker_email", "value": invoker_email},
+                    {"key": "decision", "value": "apply"},
+                ],
+            }}},
+            {"text": "Skip — use defaults", "onClick": {"action": {
+                "function": _IQ_TAILOR_FUNCTION,
+                "parameters": [
+                    {"key": "invoker_email", "value": invoker_email},
+                    {"key": "decision", "value": "skip"},
+                ],
+            }}},
+        ]}},
+    ]
+    return {"cardsV2": [{
+        "cardId": "iq_tailor",
+        "card": {
+            "header": {
+                "title": "Tailor the Customer IQ",
+                "subtitle": company or "Customer IQ",
+            },
+            "sections": [{"widgets": widgets}],
+        },
+    }]}
+
+
+async def _post_iq_result(
+    *,
+    space_resource: str,
+    thread_name: str,
+    user_email: str,
+    session_id: str,
+    reply: str,
+) -> None:
+    """Post the tailoring form (if still pending) or the final dossier reply."""
+    cfg = settings()
+    session = await _session_store.service.get_session(
+        app_name=cfg.app_name, user_id=user_email, session_id=session_id,
+    )
+    state = session.state if session else {}
+
+    if state.get(IQ_TAILOR_STATE) == "PENDING":
+        card = _build_iq_tailor_card(state.get(IQ_COMPANY_NAME) or "", user_email)
+        msg = await post_card_to_space(space_resource, card, thread_name=thread_name)
+        if msg and session:
+            await _append_state(session, {IQ_TAILOR_CARD_MSG: msg})
+        return
+
+    text = _markdown_to_chat(reply) if reply else "I wasn't able to complete the Customer IQ workflow."
+    await post_message_to_space(space_resource, text, thread_name=thread_name)
+
+
+async def _handle_iq_tailor_submit(
+    evt: CardClickedEvent, background_tasks: BackgroundTasks
+) -> dict[str, Any]:
+    """Apply the tailoring selections (or skip) and re-run the /iq pipeline."""
+    if not evt.invoker_email or not evt.thread_name:
+        return {}
+    cfg = settings()
+    session_id = _session_id_for(evt.thread_name)
+    session = await _session_store.service.get_session(
+        app_name=cfg.app_name, user_id=evt.invoker_email, session_id=session_id,
+    )
+    if session is None:
+        return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(
+            "This form has expired. Run `/iq <company>` again to start fresh."
+        )}
+    if session.state.get(IQ_TAILOR_STATE) != "PENDING":
+        return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(
+            "Already processed."
+        )}
+
+    if evt.decision == "skip":
+        tailor: dict[str, Any] = {}
+        note = "Skipping tailoring — researching with defaults now. I'll post the dossier here."
+    else:
+        tailor = {
+            "segments": _form_values(evt.form_inputs, "segments"),
+            "context": _form_text(evt.form_inputs, "context"),
+            "purpose": _form_text(evt.form_inputs, "purpose"),
+            "geo": _form_text(evt.form_inputs, "geo"),
+            "sources": _form_text(evt.form_inputs, "sources"),
+        }
+        note = "Got it — researching with your tailoring now. I'll post the dossier here."
+
+    await _append_state(session, {IQ_TAILOR: tailor, IQ_TAILOR_STATE: "RESOLVED"})
+
+    workflow = _workflow_for(session.state.get(STATE_ACTIVE_WORKFLOW_ID))
+    background_tasks.add_task(
+        _resume_iq_after_card,
+        workflow=workflow,
+        invoker_email=evt.invoker_email,
+        space_resource=evt.space_resource,
+        thread_name=evt.thread_name,
+        session_id=session_id,
+    )
+    return {"actionResponse": {"type": "UPDATE_MESSAGE"}, **_confirmation_card_body(note)}
+
+
+async def _resume_iq_after_card(
+    *,
+    workflow: Workflow,
+    invoker_email: str,
+    space_resource: str,
+    thread_name: str,
+    session_id: str,
+) -> None:
+    """Background task: re-run the /iq pipeline after the tailoring form."""
+    reply = ""
+    try:
+        reply = await _run_agent(
+            workflow=workflow,
+            user_email=invoker_email,
+            session_id=session_id,
+            prompt="(Customer IQ tailoring submitted via card — please continue)",
+        )
+    except Exception:
+        log.exception(
+            "IQ card resume failed: workflow=%s user=%s",
+            workflow.command_name, invoker_email,
+        )
+
+    await _post_iq_result(
+        space_resource=space_resource,
+        thread_name=thread_name,
+        user_email=invoker_email,
+        session_id=session_id,
+        reply=reply,
+    )
+
+
 def _build_anchor_text(
     *,
     user_resource: str,
@@ -1513,6 +2220,7 @@ async def _run_slash_workflow(
     user_display: str,
     prompt: str,
     space_resource: str,
+    attachments: tuple[Attachment, ...] = (),
 ) -> None:
     """Background task for slash-command invocations (Option C anchor flow).
 
@@ -1561,6 +2269,29 @@ async def _run_slash_workflow(
         )
         return
 
+    # RFI: download the attached .xlsx/.docx, store it on the Shared Drive, and
+    # seed RFI_FILE_ID into session state before the pipeline runs.
+    if workflow.command_id == _RFI_COMMAND_ID:
+        prep_error = await _prepare_rfi_file(
+            attachments=attachments,
+            session=resolved.session,
+        )
+        if prep_error:
+            await post_message_to_space(
+                space_resource, prep_error, thread_name=anchor_thread
+            )
+            return
+
+    # IQ: seed the company name into state before the pipeline runs so the
+    # tailoring-form resume run (which carries a generic prompt) still knows it.
+    if workflow.command_id == _IQ_COMMAND_ID:
+        prep_error = await _prepare_iq(prompt=prompt, session=resolved.session)
+        if prep_error:
+            await post_message_to_space(
+                space_resource, prep_error, thread_name=anchor_thread
+            )
+            return
+
     try:
         reply = await _run_agent(
             workflow=workflow,
@@ -1578,6 +2309,30 @@ async def _run_slash_workflow(
             space_resource,
             _GENERIC_REPLY_FAILED,
             thread_name=anchor_thread,
+        )
+        return
+
+    # RFI suspends on two forms (scope guidance, then gap-fill). Post the right
+    # card or the final reply based on post-run state.
+    if workflow.command_id == _RFI_COMMAND_ID:
+        await _post_rfi_result(
+            space_resource=space_resource,
+            thread_name=anchor_thread,
+            user_email=user_email,
+            session_id=resolved.session.id,
+            reply=reply,
+        )
+        return
+
+    # IQ suspends on the tailoring form: post the form or the final dossier reply
+    # based on post-run state.
+    if workflow.command_id == _IQ_COMMAND_ID:
+        await _post_iq_result(
+            space_resource=space_resource,
+            thread_name=anchor_thread,
+            user_email=user_email,
+            session_id=resolved.session.id,
+            reply=reply,
         )
         return
 

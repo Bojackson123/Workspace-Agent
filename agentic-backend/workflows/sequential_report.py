@@ -21,8 +21,7 @@ unaffected.
 
 from google.adk.agents import LlmAgent, SequentialAgent
 
-from agent import action_toolset, context_toolset
-from config import settings
+from agent import action_toolset, context_toolset, gemini_model
 from workflows._base import AccessMode, Workflow
 
 _RESEARCHER_INSTRUCTION = """\
@@ -51,16 +50,15 @@ async def _build(user_email: str) -> SequentialAgent:
     stale ADC tokens and half-open streams) and binds each sub-agent
     to its disjoint toolset.
     """
-    cfg = settings()
     researcher = LlmAgent(
         name="report_researcher",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_RESEARCHER_INSTRUCTION,
         tools=[context_toolset(user_email)],
     )
     drafter = LlmAgent(
         name="report_drafter",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_DRAFTER_INSTRUCTION,
         tools=[action_toolset()],
     )

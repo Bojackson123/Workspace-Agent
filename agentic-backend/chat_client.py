@@ -30,7 +30,10 @@ log = logging.getLogger(__name__)
 
 _CHAT_BOT_SCOPE: Final = "https://www.googleapis.com/auth/chat.bot"
 _CHAT_API_BASE: Final = "https://chat.googleapis.com/v1"
+_CHAT_MEDIA_BASE: Final = "https://chat.googleapis.com/v1/media"
 _REQUEST_TIMEOUT_SECONDS: Final = 30
+# Attachment downloads can be larger than a chat message; give them more room.
+_DOWNLOAD_TIMEOUT_SECONDS: Final = 60
 
 _session_lock: Final = Lock()
 _session: AuthorizedSession | None = None
@@ -159,6 +162,39 @@ async def update_card_in_space(
         await asyncio.to_thread(_put_sync, url, card_body, params)
     except Exception:
         log.exception("Failed to update card %s", message_name)
+
+
+async def download_attachment(resource_name: str) -> bytes | None:
+    """Download a Chat attachment's bytes by its ``attachmentDataRef.resourceName``.
+
+    Uploaded-content attachments expose a ``resourceName`` under
+    ``message.attachment[].attachmentDataRef``; the bytes are fetched from the
+    Chat media endpoint with the same ``chat.bot`` credentials used to post
+    messages. Returns ``None`` on failure (logged) since this runs inside a
+    background task.
+    """
+    if not resource_name:
+        log.warning("download_attachment called without resource_name; dropping")
+        return None
+    url = f"{_CHAT_MEDIA_BASE}/{resource_name}?alt=media"
+    try:
+        return await asyncio.to_thread(_download_sync, url)
+    except Exception:
+        log.exception("Failed to download Chat attachment %s", resource_name)
+        return None
+
+
+def _download_sync(url: str) -> bytes:
+    """Blocking GET for attachment media. Run in a worker thread."""
+    response = _get_session().get(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS)
+    if not response.ok:
+        log.error(
+            "Chat media download failed: status=%s body=%s",
+            response.status_code,
+            response.text[:500],
+        )
+        response.raise_for_status()
+    return response.content
 
 
 def _post_card_sync(

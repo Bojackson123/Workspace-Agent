@@ -25,8 +25,7 @@ from __future__ import annotations
 
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 
-from agent import action_toolset, context_toolset
-from config import settings
+from agent import action_toolset, context_toolset, gemini_model
 from workflows._base import AccessMode, Workflow
 from workflows.common.gate import GateAgent, GateCheck
 from workflows.common.grounding import validate_grounding
@@ -399,11 +398,9 @@ def _no_open_critical_major(state: dict) -> bool:
 # ── Pipeline factory ──────────────────────────────────────────────────────
 
 async def _build(user_email: str) -> SequentialAgent:
-    cfg = settings()
-
     template_parser = LlmAgent(
         name="template_parser",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_TEMPLATE_PARSER_INSTRUCTION,
         tools=[context_toolset(user_email)],
         output_schema=FillContract,
@@ -412,7 +409,7 @@ async def _build(user_email: str) -> SequentialAgent:
 
     section_drafter = LlmAgent(
         name="section_drafter",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_SECTION_DRAFTER_INSTRUCTION,
         tools=[context_toolset(user_email)],
         output_key=RVW_SECTIONS,
@@ -420,7 +417,7 @@ async def _build(user_email: str) -> SequentialAgent:
 
     critic = LlmAgent(
         name="critic",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_CRITIC_INSTRUCTION,
         output_schema=ObjectionLedger,
         output_key=RVW_LEDGER,
@@ -428,7 +425,7 @@ async def _build(user_email: str) -> SequentialAgent:
 
     author = LlmAgent(
         name="author",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_AUTHOR_INSTRUCTION,
         tools=[context_toolset(user_email)],
         # Author writes both sections and ledger updates; output_key writes
@@ -458,7 +455,7 @@ async def _build(user_email: str) -> SequentialAgent:
 
     assembler = LlmAgent(
         name="review_assembler",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_ASSEMBLER_INSTRUCTION,
         tools=[action_toolset()],
     )

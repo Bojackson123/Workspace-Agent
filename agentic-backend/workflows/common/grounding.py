@@ -10,8 +10,8 @@ from pydantic import BaseModel
 
 
 class SourceRef(BaseModel):
-    kind: Literal["sheet_cell", "doc_span", "transcript_span", "drive_file"]
-    locator: str  # e.g. "Budget!B12:B14", "doc#para-37", "00:14:22-00:15:01"
+    kind: Literal["sheet_cell", "doc_span", "transcript_span", "drive_file", "web"]
+    locator: str  # e.g. "Budget!B12:B14", "doc#para-37", "00:14:22-00:15:01", URL
     quote: str | None = None  # short supporting excerpt
 
 

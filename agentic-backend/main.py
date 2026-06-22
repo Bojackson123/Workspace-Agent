@@ -17,9 +17,13 @@ configure_logging()
 configure_tracing()
 
 # google-genai inspects these on import, so they must be set before any
-# downstream module pulls google.genai into the import graph.
+# downstream module pulls google.genai into the import graph. The SDK reads the
+# Vertex region from GOOGLE_CLOUD_LOCATION (not LOCATION), so mirror LOCATION
+# into it — otherwise a deployment that sets LOCATION=global is silently ignored
+# and the client falls back to its default region.
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "1"
 os.environ.setdefault("LOCATION", "us-central1")
+os.environ.setdefault("GOOGLE_CLOUD_LOCATION", os.getenv("LOCATION", "us-central1"))
 
 from dotenv import load_dotenv  # noqa: E402 — load env vars before our imports
 

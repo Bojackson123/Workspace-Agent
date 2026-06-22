@@ -32,7 +32,7 @@ from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import Event, EventActions
 from google.genai import types
 
-from agent import action_toolset, context_toolset
+from agent import action_toolset, context_toolset, gemini_model
 from config import settings
 from mcp_client import call_context_tool
 from workflows._base import AccessMode, Workflow
@@ -762,7 +762,7 @@ async def _build(user_email: str) -> SequentialAgent:
 
     _parser_llm = LlmAgent(
         name="meeting_parser_llm",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_PARSER_INSTRUCTION_FRESH,
         tools=[context_toolset(user_email)],
         output_schema=ParsedMeeting,
@@ -789,7 +789,7 @@ async def _build(user_email: str) -> SequentialAgent:
 
     notes_writer = LlmAgent(
         name="notes_writer",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_notes_instruction,
         output_key=MTG_NOTES_DOC,
     )
@@ -814,7 +814,7 @@ async def _build(user_email: str) -> SequentialAgent:
 
     assembler = LlmAgent(
         name="meeting_assembler",
-        model=cfg.agent_model,
+        model=gemini_model(),
         instruction=_ASSEMBLER_INSTRUCTION,
         tools=[context_toolset(user_email), action_toolset()],
         output_key=MTG_ASSEMBLY_STATUS,

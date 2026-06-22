@@ -297,6 +297,48 @@ def replace_text(
     return f"Replaced {occurrences} occurrence(s) of {find!r}."
 
 
+def replace_text_batch(
+    document_id: str,
+    replacements: dict[str, str],
+    match_case: bool = True,
+) -> str:
+    """Replace many find→replace pairs in a Google Doc in ONE batchUpdate.
+
+    Equivalent to calling ``replace_text`` once per entry, but issues a single
+    Docs API round-trip instead of N — used by template-fill flows (e.g. /iq)
+    that would otherwise make dozens of sequential calls. Replacements are
+    applied in the order given. Returns the total occurrences changed.
+    """
+    if not replacements:
+        return "No replacements provided; nothing to do."
+    requests = [
+        {
+            "replaceAllText": {
+                "containsText": {"text": find, "matchCase": match_case},
+                "replaceText": replace,
+            }
+        }
+        for find, replace in replacements.items()
+    ]
+    try:
+        # The doc is typically freshly copied, so the first write can hit the
+        # Drive→Docs propagation race — retry transient failures (see _retry).
+        response = retry_on_transient(
+            lambda: docs_service().documents().batchUpdate(
+                documentId=document_id,
+                body={"requests": requests},
+            ).execute()
+        )
+    except HttpError as exc:
+        return f"Error replacing text: {exc}"
+
+    replies = response.get("replies", [])
+    total = sum(
+        r.get("replaceAllText", {}).get("occurrencesChanged", 0) for r in replies
+    )
+    return f"Replaced {total} occurrence(s) across {len(requests)} token(s)."
+
+
 _TOOLS = (
     create_document,
     read_document,
@@ -304,6 +346,7 @@ _TOOLS = (
     append_markdown,
     insert_text,
     replace_text,
+    replace_text_batch,
 )
 
 
