@@ -3,9 +3,10 @@
 Pipeline:
   Sequential[
     MeetingParser                                        (fetch + structure)
-    Parallel[ EmailDrafter | CalendarPlanner |
-              TrackerUpdater | NotesWriter ]              (fan-out)
     MeetingGate                                          (pure Python)
+    OwnerAssignmentGate                                  (suspend for card)
+    ConditionalFanOut[ FanOut | CalendarCreator |
+                       NotesWriter ]                      (deterministic + LLM)
     MeetingAssembler                                     (write Workspace)
   ]
 
@@ -13,9 +14,11 @@ Invocation: /meeting <transcript-doc-url>
 
 The user passes a Google Docs URL containing the meeting transcript.
 MeetingParser fetches it via the Context MCP and directly produces a
-structured ParsedMeeting (ADK 1.0 supports output_schema + tools together);
-the four parallel agents draft artefacts into state; the gate validates
-completeness; the assembler writes to Workspace.
+structured ParsedMeeting (ADK 1.0 supports output_schema + tools together).
+The fan-out derives follow-up artefacts deterministically (see
+:mod:`workflows.meeting_engine.artifacts`); the gate (see
+:mod:`workflows.meeting_engine.gate_checks`) validates completeness; the
+assembler writes to Workspace.
 """
 
 from __future__ import annotations
@@ -23,8 +26,6 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
-from typing import Any
 
 from google.adk.agents import BaseAgent, LlmAgent, SequentialAgent
 from google.adk.agents.invocation_context import InvocationContext
@@ -36,8 +37,7 @@ from agent import action_toolset, context_toolset, gemini_model
 from config import settings
 from mcp_client import call_context_tool
 from workflows._base import AccessMode, Workflow
-from workflows.common.gate import GateAgent, GateCheck, GateVerdict
-from workflows.common.grounding import SourceRef
+from workflows.common.gate import GateAgent, GateVerdict
 from workflows.common.state_keys import (
     MTG_ASSEMBLY_STATUS,
     MTG_CALENDAR_EVENT_IDS,
@@ -50,14 +50,13 @@ from workflows.common.state_keys import (
     MTG_PARSED,
     MTG_TRACKER_ROWS,
 )
-from workflows.meeting_engine.schemas import (
-    ActionItem,
-    CalendarHold,
-    Decision,
-    EmailDraft,
-    ParsedMeeting,
-    TrackerRow,
+from workflows.meeting_engine.artifacts import (
+    _build_calendar_holds,
+    _build_email_drafts,
+    _build_tracker_rows,
 )
+from workflows.meeting_engine.gate_checks import _MEETING_GATE_CHECKS
+from workflows.meeting_engine.schemas import ParsedMeeting
 
 # ── Instructions ──────────────────────────────────────────────────────────
 
@@ -93,12 +92,11 @@ Every field in ParsedMeeting is required.
 """
 
 
-# Email drafts, calendar holds, and tracker rows are now produced
-# deterministically in Python (see _build_email_drafts / _build_calendar_holds
-# / _build_tracker_rows and MeetingFanOutAgent). Those transforms are pure
-# data mappings over the *patched* ParsedMeeting, so an owner/due-date assigned
-# via the card form is always honoured — there is no LLM reading stale parser
-# output from conversation history.
+# Email drafts, calendar holds, and tracker rows are produced deterministically
+# in Python (see workflows.meeting_engine.artifacts and MeetingFanOutAgent).
+# Those transforms are pure data mappings over the *patched* ParsedMeeting, so
+# an owner/due-date assigned via the card form is always honoured — there is no
+# LLM reading stale parser output from conversation history.
 
 _NOTES_WRITER_INSTRUCTION = """\
 You are the meeting notes writer for the Meeting Action Engine.
@@ -255,167 +253,12 @@ class ConditionalFanOutAgent(BaseAgent):
             yield event
 
 
-# ── Gate check functions ──────────────────────────────────────────────────
-
-def _check_all_owners(state: dict) -> GateCheck:
-    parsed_data = state.get(MTG_PARSED)
-    if not parsed_data:
-        return GateCheck(
-            id="owners_assigned",
-            passed=False,
-            severity="BLOCKER",
-            detail="No parsed meeting data found in state.",
-        )
-    parsed = ParsedMeeting.model_validate(parsed_data)
-    missing = [a.id for a in parsed.action_items if not a.owner]
-    return GateCheck(
-        id="owners_assigned",
-        passed=not missing,
-        severity="WARNING",
-        detail=(
-            f"Action items without owner: {missing}" if missing
-            else "All action items have an owner."
-        ),
-    )
-
-
-def _check_all_due_dates(state: dict) -> GateCheck:
-    parsed_data = state.get(MTG_PARSED)
-    if not parsed_data:
-        return GateCheck(
-            id="due_dates_set",
-            passed=False,
-            severity="BLOCKER",
-            detail="No parsed meeting data found in state.",
-        )
-    parsed = ParsedMeeting.model_validate(parsed_data)
-    missing = [a.id for a in parsed.action_items if not a.due_date]
-    return GateCheck(
-        id="due_dates_set",
-        passed=not missing,
-        severity="WARNING",
-        detail=(
-            f"Action items without due date: {missing}" if missing
-            else "All action items have a due date."
-        ),
-    )
-
-
-def _check_sources(state: dict) -> GateCheck:
-    parsed_data = state.get(MTG_PARSED)
-    if not parsed_data:
-        return GateCheck(
-            id="sources_present",
-            passed=False,
-            severity="BLOCKER",
-            detail="No parsed meeting data found in state.",
-        )
-    parsed = ParsedMeeting.model_validate(parsed_data)
-    missing_ids: list[str] = []
-    for item in parsed.action_items:
-        if not item.sources:
-            missing_ids.append(f"action:{item.id}")
-    for dec in parsed.decisions:
-        if not dec.sources:
-            missing_ids.append(f"decision:{dec.id}")
-    return GateCheck(
-        id="sources_present",
-        passed=not missing_ids,
-        severity="BLOCKER",
-        detail=(
-            f"Items/decisions with no source references: {missing_ids}"
-            if missing_ids
-            else "All items and decisions have source references."
-        ),
-    )
-
-
-def _warn_stale_dates(state: dict) -> GateCheck:
-    parsed_data = state.get(MTG_PARSED)
-    if not parsed_data:
-        return GateCheck(
-            id="dates_not_stale",
-            passed=True,
-            severity="WARNING",
-            detail="No parsed meeting data (skipping stale-date check).",
-        )
-    parsed = ParsedMeeting.model_validate(parsed_data)
-    today = datetime.now(timezone.utc).date().isoformat()
-    stale = [
-        a.id for a in parsed.action_items
-        if a.due_date and a.due_date <= today
-    ]
-    return GateCheck(
-        id="dates_not_stale",
-        passed=not stale,
-        severity="WARNING",
-        detail=(
-            f"Action items with past or today due dates: {stale}"
-            if stale
-            else "No stale due dates."
-        ),
-    )
-
-
-def _normalize_identity(s: str) -> str:
-    """Normalize an email or name to a comparable token.
-
-    "sarah.chen@acmecorp.com" -> "sarah chen"
-    "Sarah Chen"              -> "sarah chen"
-    """
-    local = s.split("@")[0]
-    return local.lower().replace(".", " ").replace("_", " ").replace("-", " ")
-
-
-def _warn_unattributed_attendees(state: dict) -> GateCheck:
-    parsed_data = state.get(MTG_PARSED)
-    if not parsed_data:
-        return GateCheck(
-            id="attendees_attributed",
-            passed=True,
-            severity="WARNING",
-            detail="No parsed meeting data (skipping attendee check).",
-        )
-    parsed = ParsedMeeting.model_validate(parsed_data)
-    # Match each attendee against the owners by identity keys (name and/or
-    # email), so a "Name (email)" attendee still matches a name-only owner.
-    # A plain string-equality check fails on the combined "Name (email)" form.
-    owner_key_sets = [
-        _identity_keys(item.owner)
-        for item in parsed.action_items
-        if item.owner
-    ]
-    unattributed = [
-        a for a in parsed.attendees
-        if not any(_identity_keys(a) & owner_keys for owner_keys in owner_key_sets)
-    ]
-    return GateCheck(
-        id="attendees_attributed",
-        passed=not unattributed,
-        severity="WARNING",
-        detail=(
-            f"Attendees with no attributed items: {unattributed}"
-            if unattributed
-            else "All attendees attributed."
-        ),
-    )
-
-
-_MEETING_GATE_CHECKS = [
-    _check_all_owners,
-    _check_all_due_dates,
-    _check_sources,
-    _warn_stale_dates,
-    _warn_unattributed_attendees,
-]
-
-
 class OwnerAssignmentGate(BaseAgent):
     """Pure-Python gate that suspends the pipeline when action items lack owners.
 
     On the initial run, if the ``owners_assigned`` check in
     ``MTG_GATE_VERDICT`` failed, this gate sets ``MTG_OWNER_GATE_STATE``
-    to ``"PENDING"`` so that chat.py can post the owner-assignment card.
+    to ``"PENDING"`` so that the chat layer can post the owner-assignment card.
 
     On the card-submission re-run ``MTG_OWNER_GATE_STATE`` is already
     ``"RESOLVED"`` (patched by the card handler before re-running), so
@@ -466,142 +309,6 @@ class OwnerAssignmentGate(BaseAgent):
                     parts=[types.Part(text="Owner gate: all action items have owners — continuing.")],
                 ),
             )
-
-
-# ── Deterministic fan-out builders ────────────────────────────────────────
-#
-# These derive the follow-up artefacts directly from a ParsedMeeting value.
-# They are pure functions over the *patched* object, so an owner or due-date
-# supplied via the card form is always reflected — unlike an LLM that would
-# read the original (null-owner) parse from conversation history.
-
-def _short_name(owner: str) -> str:
-    """Best-effort display name: strip a trailing ``(email)`` if present."""
-    return owner.split("(")[0].strip() or owner
-
-
-def _identity_keys(s: str) -> set[str]:
-    """Comparable identity tokens for an owner/attendee string.
-
-    Splits a "Name (email)", bare email, or bare name into the keys that can
-    match it: the lowercased email, its normalised local part, and the
-    normalised name. Lets us match "Sarah Chen" against
-    "Sarah Chen (sarah.chen@corp.com)" *and* "priya@corp.com" against
-    "Priya Nair (priya@corp.com)".
-    """
-    s = s.strip()
-    email: str | None = None
-    if s.endswith(")") and "(" in s:
-        inner = s[s.rfind("(") + 1 : -1].strip()
-        name = s[: s.rfind("(")].strip()
-        if "@" in inner:
-            email = inner
-    elif "@" in s:
-        email, name = s, ""
-    else:
-        name = s
-
-    keys: set[str] = set()
-    if email:
-        keys.add(email.lower())
-        keys.add(_normalize_identity(email))
-    if name:
-        keys.add(_normalize_identity(name))
-    return keys
-
-
-def _resolve_recipient(owner: str, attendees: list[str]) -> str:
-    """Resolve an owner to a sendable recipient by matching the attendee list.
-
-    Owners are stored as display names ("Sarah Chen"), but ``create_gmail_draft``
-    needs an address. The attendee list carries the full "Name (email)" form, so
-    we match the owner against it and return that fuller string — which the Gmail
-    tool turns into "Name <email>". Falls back to the owner unchanged if no
-    attendee matches (e.g. no email was ever captured).
-    """
-    owner_keys = _identity_keys(owner)
-    for attendee in attendees:
-        if owner_keys & _identity_keys(attendee):
-            return attendee
-    return owner
-
-
-def _build_email_drafts(parsed: ParsedMeeting) -> list[EmailDraft]:
-    """One email per owner, listing all of that owner's action items.
-
-    Items with no owner are skipped (there is no one to send to). Owners are
-    kept in first-seen order so output is stable across runs.
-    """
-    by_owner: dict[str, list[ActionItem]] = {}
-    for item in parsed.action_items:
-        if not item.owner:
-            continue
-        by_owner.setdefault(item.owner, []).append(item)
-
-    drafts: list[EmailDraft] = []
-    for owner, items in by_owner.items():
-        bullet_lines = [
-            f"• {it.description} (due: {it.due_date or 'TBD'})" for it in items
-        ]
-        lead = "is your action item" if len(items) == 1 else "are your action items"
-        body = (
-            f"Hi {_short_name(owner)},\n\n"
-            f"Following up on \"{parsed.title}\". Here {lead}:\n\n"
-            + "\n".join(bullet_lines)
-            + "\n\nThanks!"
-        )
-        drafts.append(
-            EmailDraft(
-                owner=owner,
-                to=_resolve_recipient(owner, parsed.attendees),
-                subject=f"Action items from {parsed.title}",
-                body=body,
-            )
-        )
-    return drafts
-
-
-def _build_calendar_holds(parsed: ParsedMeeting) -> list[CalendarHold]:
-    """A 30-minute 09:00 reminder hold for every item that has a due_date.
-
-    Holds are created with NO attendees — they are personal reminders on the
-    triggerer's own calendar. Inviting other people is an explicit, opt-in step
-    handled afterward by the "invite people" dialog (which patches the events),
-    so /meeting never adds anyone to an event without the user choosing to.
-    """
-    holds: list[CalendarHold] = []
-    for item in parsed.action_items:
-        if not item.due_date:
-            continue
-        holds.append(
-            CalendarHold(
-                summary=f"Reminder: {item.description}",
-                start_datetime=f"{item.due_date}T09:00:00",
-                end_datetime=f"{item.due_date}T09:30:00",
-                attendees=[],
-                description=(
-                    f"Auto-created reminder for action item {item.id}.\n"
-                    f"Owner: {item.owner or 'UNASSIGNED'}\n"
-                    f"From meeting: {parsed.title}"
-                ),
-                action_item_id=item.id,
-            )
-        )
-    return holds
-
-
-def _build_tracker_rows(parsed: ParsedMeeting) -> list[TrackerRow]:
-    """One tracker row per action item (owner/due_date may be null)."""
-    return [
-        TrackerRow(
-            id=item.id,
-            description=item.description,
-            owner=item.owner,
-            due_date=item.due_date,
-            source_locators=[s.locator for s in item.sources],
-        )
-        for item in parsed.action_items
-    ]
 
 
 class MeetingFanOutAgent(BaseAgent):
