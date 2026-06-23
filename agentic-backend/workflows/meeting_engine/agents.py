@@ -5,8 +5,8 @@ Pipeline:
     MeetingParser                                        (fetch + structure)
     MeetingGate                                          (pure Python)
     OwnerAssignmentGate                                  (suspend for card)
-    ConditionalFanOut[ FanOut | CalendarCreator |
-                       NotesWriter ]                      (deterministic + LLM)
+    GuardAgent[ FanOut | CalendarCreator |
+                NotesWriter ]                             (deterministic + LLM)
     MeetingAssembler                                     (write Workspace)
   ]
 

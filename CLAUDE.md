@@ -76,17 +76,28 @@ the Shared Drive). The LLM never sees the user's email — it travels as the
 A prompt-injected or hallucinating agent therefore *structurally* cannot reach
 the user's personal data with write scopes, or write outside the Shared Drive.
 
-**Request lifecycle (`agentic-backend/chat.py`):** verify Chat JWT
-(`security.py`, before the body is parsed) → parse event → dispatch by
-`commandId` → authorize (`access.py` + `access_store.py`) → resolve session
-(`sessions.py`) → build a fresh agent (`agent.py`) → run → post reply via
+**Request lifecycle (the `agentic-backend/chat/` package):** verify Chat JWT
+(`security.py`, before the body is parsed) → `chat/dispatch.py` parses the
+event and dispatches by `commandId` → authorize (`access.py` +
+`access_store.py`) → resolve session (`sessions.py`) → build a fresh agent
+(`agent.py`) → `chat/runner.py` runs it and posts the reply via
 `chat_client.py`. The webhook **always returns `{}` synchronously** and runs
 the agent inside FastAPI `BackgroundTasks`, because multi-tool agent runs blow
 past Chat's ~6s "not responding" banner and 30s timeout. Slash invocations are
-private in Chat and can't take threaded bot replies, so `_run_slash_workflow`
+private in Chat and can't take threaded bot replies, so `runner._run_slash_workflow`
 first posts a **public anchor message**, captures the thread Chat creates, and
 uses that thread as both the ADK session key and the reply target. Plain
-follow-ups (`_run_plain_workflow`) reply into the inbound thread.
+follow-ups (`runner._run_plain_workflow`) reply into the inbound thread.
+
+The `chat/` package splits the concerns: `events.py` (typed payload parsing),
+`formatting.py` (markdown→Chat), `dispatch.py` (routing — the public
+`handle_event`), `reserved.py` (`/exit`/`/help`/admin), `runner.py` (agent
+execution + reply-posting tasks), `stores.py` (the session/access singletons),
+and `cards/` for the suspend/resume form UIs. **CARD_CLICKED events route
+through a string-keyed registry** (`cards/registry.py`'s `@register_card`),
+not an if-ladder; unknown functions fall back to the meeting owner-assignment
+handler. The runner↔cards import cycle is broken by a lazy `from chat import
+cards` inside `_run_slash_workflow`.
 
 **Workflows (`agentic-backend/workflows/`):** one module/package per slash
 command, each exporting `WORKFLOW: Workflow`. `__init__.py` imports them
@@ -98,9 +109,18 @@ dispatcher calls per request; it may return **any** ADK `BaseAgent`:
   `research.py` (`CONTEXT` toolset) and `draft.py` (`ACTION` toolset).
 - Richer multi-stage shapes build agents directly via the public factories in
   `agent.py` (`context_toolset`, `action_toolset`, `build_llm_agent`): see
-  `sequential_report.py` (`SequentialAgent`) and the package workflows
-  `meeting_engine/`, `review_board/`, `rfi_engine/`, `iq_engine/` (each is
-  `agents.py` + `schemas.py`, with shared pieces in `workflows/common/`).
+  `sequential_report.py` (`SequentialAgent`) and the engine packages
+  `meeting_engine/`, `review_board/`, `rfi_engine/`, `iq_engine/`. Each is
+  `agents.py` (the pipeline + `WORKFLOW`) + `schemas.py`, plus per-engine
+  helpers split out as size warrants — e.g. `gate_checks.py`, `artifacts.py`,
+  `research.py`, `rendering.py`.
+
+`workflows/common/` holds the reusable building blocks: `gate.py` (`GateAgent`),
+`loop_exit.py`, `conditional.py` (`GuardAgent` — the skip-or-delegate wrapper
+shared by the engine guards), `events.py` (`model_event`), `state_parse.py`
+(`coerce_model`/`coerce_model_list` for the dict|JSON|model-dump values ADK
+stores), `grounding.py`, `egress.py`, `retry.py`, `state_keys.py` (canonical
+`session.state` key constants — never inline these strings).
 
 Toolset scoping is structural: a workflow declaring only `{CONTEXT}` has no
 Action MCP attached to its agent at all. Splitting a multi-stage workflow into

@@ -2,14 +2,12 @@
 
 Pipeline:
   Sequential[
-    ConditionalParserAgent      (LLM, guarded: extract questions from the file)
+    GuardAgent[ parser_llm ]    (LLM, guarded: extract questions from the file)
     GuidanceGate                (deterministic: suspend for Form 1)
     ConditionalResearchAgent    (LLM batches: answer each question, grounded)
     RFIGate                     (pure Python: completeness + grounding checks)
     GapFillGate                 (deterministic: suspend for Form 2 if gaps)
-    ConditionalAssemblerAgent[  (skip while either form is pending)
-        RFIAssembler            (deterministic: fill the file, post the link)
-    ]
+    GuardAgent[ RFIAssembler ]  (skip while either form is pending; else fill)
   ]
 
 Invocation: /rfi  with an .xlsx/.docx RFI document attached.
