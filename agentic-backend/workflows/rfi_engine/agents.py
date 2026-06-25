@@ -42,6 +42,7 @@ from workflows.common.conditional import GuardAgent
 from workflows.common.events import model_event
 from workflows.common.gate import GateAgent
 from workflows.common.state_keys import (
+    RFI_ANSWERS,
     RFI_ASSEMBLY_STATUS,
     RFI_COMPLETED_MARKER,
     RFI_FILE_ID,
