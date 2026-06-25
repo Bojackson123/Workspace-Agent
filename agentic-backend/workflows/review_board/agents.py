@@ -23,6 +23,8 @@ Shared Drive.
 
 from __future__ import annotations
 
+import json
+
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 
 from agent import action_toolset, context_toolset, gemini_model
@@ -30,6 +32,7 @@ from workflows._base import AccessMode, Workflow
 from workflows.common.gate import GateAgent, GateCheck
 from workflows.common.grounding import validate_grounding
 from workflows.common.loop_exit import LoopExitChecker
+from workflows.common.state_parse import coerce_model
 from workflows.common.state_keys import (
     RVW_FILL_CONTRACT,
     RVW_GATE_FAILED,
@@ -41,7 +44,6 @@ from workflows.review_board.schemas import (
     FilledSection,
     FillContract,
     ObjectionLedger,
-    TemplateField,
 )
 
 # ── Instructions ──────────────────────────────────────────────────────────
@@ -184,6 +186,29 @@ Return:
 """
 
 
+# ── State parsing ──────────────────────────────────────────────────────────
+
+def _sections_from_state(state: dict) -> list[FilledSection] | None:
+    """Parse ``RVW_SECTIONS`` (a list or a JSON-array string) into sections.
+
+    The section drafter writes through an ``output_key`` without a schema, so
+    the value is a raw string on the first pass and a list once re-stored.
+    Returns ``None`` to signal an unparseable string (the caller turns that into
+    a BLOCKER); an empty list means there simply were no sections.
+    """
+    raw = state.get(RVW_SECTIONS)
+    if isinstance(raw, list):
+        return [FilledSection.model_validate(s) for s in raw]
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if isinstance(decoded, list):
+            return [FilledSection.model_validate(s) for s in decoded]
+    return []
+
+
 # ── Gate check functions ──────────────────────────────────────────────────
 
 def _check_mandatory_fields_filled(state: dict) -> GateCheck:
@@ -198,24 +223,14 @@ def _check_mandatory_fields_filled(state: dict) -> GateCheck:
         )
     contract = FillContract.model_validate(contract_data)
 
-    # sections_data is stored as a raw string (LlmAgent output_key without schema)
-    # Parse it: it may be a JSON array or wrapped in text
-    import json
-    sections: list[FilledSection] = []
-    if isinstance(sections_data, list):
-        sections = [FilledSection.model_validate(s) for s in sections_data]
-    elif isinstance(sections_data, str):
-        try:
-            raw = json.loads(sections_data)
-            if isinstance(raw, list):
-                sections = [FilledSection.model_validate(s) for s in raw]
-        except (json.JSONDecodeError, ValueError):
-            return GateCheck(
-                id="mandatory_fields_filled",
-                passed=False,
-                severity="BLOCKER",
-                detail="Could not parse sections from state.",
-            )
+    sections = _sections_from_state(state)
+    if sections is None:
+        return GateCheck(
+            id="mandatory_fields_filled",
+            passed=False,
+            severity="BLOCKER",
+            detail="Could not parse sections from state.",
+        )
 
     filled_ids = {s.field_id for s in sections if s.content.strip()}
     missing = [f.id for f in contract.fields if f.mandatory and f.id not in filled_ids]
@@ -241,25 +256,17 @@ def _check_quantitative_grounding(state: dict) -> GateCheck:
             detail="No sections or contract in state (skipping grounding check).",
         )
 
-    import json
     contract = FillContract.model_validate(contract_data)
     quant_fields = {f.id for f in contract.fields if f.needs_quantitative}
 
-    sections: list[FilledSection] = []
-    if isinstance(sections_data, list):
-        sections = [FilledSection.model_validate(s) for s in sections_data]
-    elif isinstance(sections_data, str):
-        try:
-            raw = json.loads(sections_data)
-            if isinstance(raw, list):
-                sections = [FilledSection.model_validate(s) for s in raw]
-        except (json.JSONDecodeError, ValueError):
-            return GateCheck(
-                id="quantitative_grounded",
-                passed=False,
-                severity="BLOCKER",
-                detail="Could not parse sections for grounding check.",
-            )
+    sections = _sections_from_state(state)
+    if sections is None:
+        return GateCheck(
+            id="quantitative_grounded",
+            passed=False,
+            severity="BLOCKER",
+            detail="Could not parse sections for grounding check.",
+        )
 
     ungrounded: list[str] = []
     for section in sections:
@@ -290,20 +297,14 @@ def _check_no_open_critical_objections(state: dict) -> GateCheck:
             detail="No ledger in state — assuming no objections.",
         )
 
-    import json
-    ledger: ObjectionLedger | None = None
-    if isinstance(ledger_data, dict):
-        ledger = ObjectionLedger.model_validate(ledger_data)
-    elif isinstance(ledger_data, str):
-        try:
-            ledger = ObjectionLedger.model_validate_json(ledger_data)
-        except Exception:
-            return GateCheck(
-                id="no_open_critical_objections",
-                passed=False,
-                severity="BLOCKER",
-                detail="Could not parse ledger for objection check.",
-            )
+    ledger = coerce_model(ledger_data, ObjectionLedger)
+    if ledger is None:
+        return GateCheck(
+            id="no_open_critical_objections",
+            passed=False,
+            severity="BLOCKER",
+            detail="Could not parse ledger for objection check.",
+        )
 
     blocking = [
         f"{o.id}({o.severity}): {o.claim_under_attack[:60]}"
@@ -331,20 +332,14 @@ def _warn_accepted_risks(state: dict) -> GateCheck:
             detail="No ledger in state.",
         )
 
-    import json
-    ledger: ObjectionLedger | None = None
-    if isinstance(ledger_data, dict):
-        ledger = ObjectionLedger.model_validate(ledger_data)
-    elif isinstance(ledger_data, str):
-        try:
-            ledger = ObjectionLedger.model_validate_json(ledger_data)
-        except Exception:
-            return GateCheck(
-                id="accepted_risks",
-                passed=True,
-                severity="WARNING",
-                detail="Could not parse ledger for risk check.",
-            )
+    ledger = coerce_model(ledger_data, ObjectionLedger)
+    if ledger is None:
+        return GateCheck(
+            id="accepted_risks",
+            passed=True,
+            severity="WARNING",
+            detail="Could not parse ledger for risk check.",
+        )
 
     risks = [
         f"{o.id}: {o.claim_under_attack[:60]}"
@@ -379,13 +374,8 @@ def _no_open_critical_major(state: dict) -> bool:
     if not ledger_data:
         return True  # no ledger → nothing blocking
 
-    import json
-    try:
-        if isinstance(ledger_data, dict):
-            ledger = ObjectionLedger.model_validate(ledger_data)
-        else:
-            ledger = ObjectionLedger.model_validate_json(str(ledger_data))
-    except Exception:
+    ledger = coerce_model(ledger_data, ObjectionLedger)
+    if ledger is None:
         return False  # parse failure → keep looping
 
     return not any(
