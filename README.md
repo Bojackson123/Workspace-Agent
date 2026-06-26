@@ -5,9 +5,9 @@ An enterprise Google Chat assistant that reads a user's Workspace context
 files) into a designated Shared Drive — with a hard security boundary
 between the two halves.
 
-A single Chat app exposes several **slash commands** (`/research`,
-`/draft`, …); each routes to its own workflow with its own system prompt
-and toolset scope. Conversations are multi-turn per Chat thread, backed
+A single Chat app exposes several **slash commands** (`/meeting`,
+`/review`, `/rfi`); each routes to its own workflow with its own system
+prompt and toolset scope. Conversations are multi-turn per Chat thread, backed
 by a persistent session store. Access to each command is governed by a
 database-backed rules table — email and domain allowlists, managed at
 runtime via `/grant` and `/revoke` slash commands so ops can change
@@ -26,7 +26,10 @@ If the agent is ever prompt-injected or hallucinates an action, it
 *structurally* cannot modify the user's personal data: the read-only
 credentials live on a different server with different scopes.
 
-See [`Docs/Architecture.md`](Docs/Architecture.md) for the full
+New to the code? Start with
+[`Docs/Code-Walkthrough.md`](Docs/Code-Walkthrough.md) — it traces one
+request from the entry point to the reply, file by file. See
+[`Docs/Architecture.md`](Docs/Architecture.md) for the full
 architecture, cloud-resource layout, IAM roles, and reproducible setup
 steps. For "how it flows" Mermaid diagrams, see
 [`Docs/Workflow-Engine.md`](Docs/Workflow-Engine.md) (dispatch,
@@ -39,26 +42,38 @@ pipeline with its gate and suspend/resume card flow).
 ```
 .
 ├── agentic-backend/         FastAPI webhook + ADK agent
-│   ├── main.py              POST / entry point + JWT verification wiring
-│   ├── security.py          Google Chat OIDC token verification
-│   ├── chat.py              Chat event → workflow dispatch → reply envelope
-│   ├── agent.py             LlmAgent factory (workflow-scoped toolsets)
-│   ├── workflows/           Slash-command registry (one module/package per workflow)
+│   ├── main.py              POST / entry point (the only file at the root)
+│   ├── engine/              Composable engine framework
+│   │   ├── spec.py          EngineSpec + typed stage specs
+│   │   ├── compiler.py      build_engine(): spec → SequentialAgent
+│   │   ├── registry.py      String-keyed component registry
+│   │   ├── form_gate.py     FormGate (suspend/resume primitive)
+│   │   └── assembler.py     IdempotentAssembler (deterministic-writer primitive)
+│   ├── workflows/           One package per slash command; each declares an EngineSpec
 │   │   ├── __init__.py      Explicit dispatch list + lookups
 │   │   ├── _base.py         Workflow dataclass, AccessMode, reserved IDs
 │   │   ├── _helpers.py      llm_workflow() helper for single-LlmAgent flows
 │   │   ├── _default.py      DEFAULT_WORKFLOW (free-form fallback)
-│   │   ├── research.py      /research — single LlmAgent on Context MCP
-│   │   ├── draft.py         /draft — single LlmAgent on Action MCP
-│   │   ├── sequential_report.py   /report — SequentialAgent example
-│   │   ├── meeting_engine/  /meeting — gate + suspend/resume card pipeline
+│   │   ├── meeting_engine/  /meeting — gate + owner card + deterministic fan-out
 │   │   ├── review_board/    /review — adversarial critic LoopAgent pipeline
+│   │   ├── rfi_engine/      /rfi — two suspend forms + batched research
 │   │   └── common/          Shared building blocks (gate, grounding, loop_exit)
-│   ├── access.py            Email / domain / Google-Group authorization
-│   ├── access_store.py      DB-backed access-rule store
-│   ├── sessions.py          Thread-keyed multi-turn session store
-│   ├── manage_access.py     Break-glass CLI for access rules
-│   ├── config.py            Env-backed settings
+│   ├── chat/                Google Chat I/O
+│   │   ├── dispatch.py      Chat event → workflow dispatch → reply envelope
+│   │   ├── runner.py        Background agent run + reply posting
+│   │   ├── client.py        Outbound Chat REST client
+│   │   ├── security.py      Google Chat OIDC token verification
+│   │   └── cards/           Suspend/resume form UIs + dispatch hooks
+│   ├── clients/             Outbound service clients
+│   │   ├── agent.py         LlmAgent + toolset factories (model, MCP toolsets)
+│   │   └── mcp_client.py    Direct (non-LLM) MCP client
+│   ├── access/              Access control
+│   │   ├── policy.py        Email / domain / Google-Group authorization
+│   │   ├── store.py         DB-backed access-rule store
+│   │   └── manage.py        Break-glass CLI (python -m access.manage)
+│   ├── sessions/            Thread-keyed multi-turn session store
+│   ├── config/              Env-backed settings
+│   ├── observability/       logging_setup.py · tracing_setup.py
 │   └── Dockerfile
 │
 ├── mcp-servers/
@@ -78,6 +93,7 @@ pipeline with its gate and suspend/resume card flow).
 │       └── Dockerfile
 │
 └── Docs/
+    ├── Code-Walkthrough.md  Entry-point→endpoint tour, file by file
     ├── Architecture.md      Full architecture + cloud setup + IAM
     ├── Workflow-Engine.md   Engine flowcharts (dispatch, auth, sessions)
     └── Meeting-Workflow.md  /meeting pipeline flowcharts (gate + cards)
@@ -110,22 +126,22 @@ The backend creates a local SQLite file `agentic-backend/sessions.db`
 on first request (holds both ADK sessions and access rules). Delete
 the file to reset state.
 
-Defaults in `agentic-backend/config.py` point at `localhost:8001` /
+Defaults in `agentic-backend/config/` point at `localhost:8001` /
 `localhost:8002`, and `CHAT_APP_AUDIENCE` defaults to `None` so the JWT
 audience check is skipped during local development.
 
-You can also iterate on the agent without the webhook layer using the
-ADK CLI:
+You can also iterate on a real workflow without the webhook layer using
+the ADK CLI's dev harness (set `DEV_USER_EMAIL`, optionally
+`DEV_WORKFLOW=/meeting|/review|/rfi`, in `agentic-backend/.env`):
 
 ```powershell
 cd agentic-backend
-uv run adk run agent       # or: uv run adk web
+uv run adk web dev/
 ```
 
-Note that `adk run`/`adk web` exercise the bare `root_agent` and cannot
-inject a user email or a slash-command workflow, so Context MCP tools
-will not work in that mode — the live MCP toolsets are wired only
-inside the per-request `build_agent_for_workflow` factory.
+The dev harness builds an actual workflow agent with live MCP toolsets
+scoped to `DEV_USER_EMAIL`. (Only `main.py` lives at the backend root now,
+so there is no bare root-level agent for `adk run` to discover.)
 
 ## Adding a slash-command workflow
 
@@ -142,7 +158,7 @@ Each command lives in two places that must stay in lockstep:
    `workflows/__init__.py` so the dispatcher picks it up.
 
 For the common single-LlmAgent case, use the `llm_workflow` helper
-(see `workflows/research.py`):
+(see `workflows/_default.py` for the shape):
 
 ```python
 # workflows/audit.py
@@ -150,7 +166,7 @@ from workflows._base import AccessMode, ToolsetKind
 from workflows._helpers import llm_workflow
 
 WORKFLOW = llm_workflow(
-    command_id=6,
+    command_id=8,
     command_name="/audit",
     description="...",
     instruction="...",
@@ -159,10 +175,11 @@ WORKFLOW = llm_workflow(
 )
 ```
 
-For richer flows, build the agent directly (see
-`workflows/sequential_report.py` for a `SequentialAgent` that chains
-a research stage into a drafting stage). The dispatcher does not care
-which `BaseAgent` subclass `build_agent` returns.
+For a richer multi-stage flow, declare an `EngineSpec` and let
+`build_engine(spec, user_email)` compile it — see `engine/` for the
+framework and `workflows/rfi_engine/agents.py` for a worked example
+(parser → form gates → research → gate → assembler). The dispatcher
+does not care which `BaseAgent` subclass `build_agent` returns.
 
 Pass an optional `ack_message="On it — …"` to either `llm_workflow(...)`
 or the `Workflow(...)` constructor. The webhook returns that string
@@ -240,7 +257,7 @@ small set of explicit emails for now; we can add group lookups back
 later with a concrete use case to justify the wiring.
 
 For the cases the chat path can't handle (DB corruption, lost admin
-access, automated provisioning), `manage_access.py` is a CLI with the
+access, automated provisioning), `access/manage.py` is a CLI with the
 same `grant` / `revoke` / `list` subcommands.
 
 ### Multi-turn semantics

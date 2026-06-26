@@ -19,17 +19,17 @@ from google.adk.events import Event, EventActions
 
 from chat import runner
 from chat.cards.common import _confirmation_card_body
-from chat.cards.registry import register_card
+from chat.cards.registry import register_card, register_default_post
 from chat.events import CardClickedEvent
 from chat.formatting import _markdown_to_chat
 from chat.stores import _session_store
-from chat_client import (
+from chat.client import (
     post_card_to_space,
     post_message_to_space,
     update_card_in_space,
 )
 from config import settings
-from mcp_client import call_context_tool
+from clients.mcp_client import call_context_tool
 from sessions import STATE_ACTIVE_WORKFLOW_ID, _session_id_for
 from workflows import Workflow
 from workflows.common.state_keys import (
@@ -699,10 +699,11 @@ async def _apply_invites(
 
 
 # ---------------------------------------------------------------------------
-# Post-run result for meeting and the generic (non-RFI/IQ) workflows
+# Post-run result for meeting and the generic (non-RFI) workflows
 # ---------------------------------------------------------------------------
 
 
+@register_default_post
 async def post_default_result(
     *,
     space_resource: str,

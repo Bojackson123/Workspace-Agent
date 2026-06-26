@@ -1,24 +1,24 @@
-"""/meeting — Meeting Action Engine.
+"""/meeting — Meeting Action Engine (declared as an :class:`EngineSpec`).
 
 Pipeline:
   Sequential[
-    MeetingParser                                        (fetch + structure)
-    MeetingGate                                          (pure Python)
-    OwnerAssignmentGate                                  (suspend for card)
-    GuardAgent[ FanOut | CalendarCreator |
-                NotesWriter ]                             (deterministic + LLM)
-    MeetingAssembler                                     (write Workspace)
+    LlmStage(meeting_parser)    guarded: fetch + structure the transcript
+    Gate(meeting_gate)          pure-Python completeness checks
+    FormGate(owner)             suspend for the owner-assignment card
+    Sequential(fan_out)         guarded: deterministic drafts/holds/rows + notes
+    LlmStage(assembler)         write Docs/Sheets/Gmail drafts to Workspace
   ]
 
 Invocation: /meeting <transcript-doc-url>
 
-The user passes a Google Docs URL containing the meeting transcript.
-MeetingParser fetches it via the Context MCP and directly produces a
-structured ParsedMeeting (ADK 1.0 supports output_schema + tools together).
-The fan-out derives follow-up artefacts deterministically (see
-:mod:`workflows.meeting_engine.artifacts`); the gate (see
-:mod:`workflows.meeting_engine.gate_checks`) validates completeness; the
-assembler writes to Workspace.
+The parser fetches the Google Doc via the Context MCP and produces a structured
+``ParsedMeeting``. The fan-out derives follow-up artefacts deterministically
+(see :mod:`workflows.meeting_engine.artifacts`) so card-patched owners/dates are
+always honoured; the gate (see :mod:`workflows.meeting_engine.gate_checks`)
+validates completeness; the assembler writes to Workspace.
+
+This module declares the spec and registers the engine-specific components it
+references; the generic stage machinery lives in :mod:`engine`.
 """
 
 from __future__ import annotations
@@ -27,18 +27,15 @@ import json
 import re
 from collections.abc import AsyncGenerator
 
-from google.adk.agents import BaseAgent, LlmAgent, SequentialAgent
+from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import Event
 
-from agent import action_toolset, context_toolset, gemini_model
-from config import settings
-from mcp_client import call_context_tool
+from clients.mcp_client import call_context_tool
 from workflows._base import AccessMode, Workflow
-from workflows.common.conditional import GuardAgent
 from workflows.common.events import model_event
-from workflows.common.gate import GateAgent, GateVerdict
+from workflows.common.gate import GateVerdict
 from workflows.common.state_keys import (
     MTG_ASSEMBLY_STATUS,
     MTG_CALENDAR_EVENT_IDS,
@@ -50,6 +47,18 @@ from workflows.common.state_keys import (
     MTG_OWNER_GATE_STATE,
     MTG_PARSED,
     MTG_TRACKER_ROWS,
+)
+from engine import (
+    CustomStageSpec,
+    EngineSpec,
+    FormGateStageSpec,
+    GateStageSpec,
+    GuardSpec,
+    LlmStageSpec,
+    SequentialStageSpec,
+    ToolsetRef,
+    build_engine,
+    registry,
 )
 from workflows.meeting_engine.artifacts import (
     _build_calendar_holds,
@@ -185,6 +194,26 @@ URL, notes URL, any items marked UNASSIGNED/TBD), then end with the exact line:
 """
 
 
+@registry.instruction("mtg.notes")
+def _notes_instruction(ctx: ReadonlyContext) -> str:
+    """Instruction provider: inline the patched ParsedMeeting for the notes LLM.
+
+    Injecting the JSON directly (rather than relying on conversation history)
+    guarantees the notes reflect card-form owner/due-date edits.
+    """
+    parsed = ctx.state.get(MTG_PARSED) or {}
+    parsed_json = json.dumps(parsed, indent=2, ensure_ascii=False)
+    return (
+        f"{_NOTES_WRITER_INSTRUCTION}\n\n"
+        "Parsed meeting data (authoritative):\n```json\n"
+        f"{parsed_json}\n```\n"
+    )
+
+
+# ── State predicates ───────────────────────────────────────────────────────
+
+
+@registry.predicate("mtg.parsed")
 def _meeting_already_parsed(state: dict) -> bool:
     """True on a re-run where MTG_PARSED is already in state.
 
@@ -195,6 +224,12 @@ def _meeting_already_parsed(state: dict) -> bool:
     return state.get(MTG_PARSED) is not None
 
 
+@registry.predicate("mtg.owner_resolved")
+def _owner_resolved(state: dict) -> bool:
+    return state.get(MTG_OWNER_GATE_STATE) == "RESOLVED"
+
+
+@registry.predicate("mtg.owner_pending")
 def _owner_gate_pending(state: dict) -> bool:
     """True while the owner-assignment card is awaiting submission.
 
@@ -205,49 +240,23 @@ def _owner_gate_pending(state: dict) -> bool:
     return state.get(MTG_OWNER_GATE_STATE) == "PENDING"
 
 
-class OwnerAssignmentGate(BaseAgent):
-    """Pure-Python gate that suspends the pipeline when action items lack owners.
+@registry.predicate("mtg.needs_owner_card")
+def _needs_owner_card(state: dict) -> bool:
+    """True when the gate flagged missing owners/due-dates (post the card)."""
+    verdict_data = state.get(MTG_GATE_VERDICT)
+    if not verdict_data:
+        return False
+    try:
+        verdict = GateVerdict.model_validate(verdict_data)
+    except Exception:
+        return False
+    return any(
+        c.id in ("owners_assigned", "due_dates_set") and not c.passed
+        for c in verdict.checks
+    )
 
-    On the initial run, if the ``owners_assigned`` check in
-    ``MTG_GATE_VERDICT`` failed, this gate sets ``MTG_OWNER_GATE_STATE``
-    to ``"PENDING"`` so that the chat layer can post the owner-assignment card.
 
-    On the card-submission re-run ``MTG_OWNER_GATE_STATE`` is already
-    ``"RESOLVED"`` (patched by the card handler before re-running), so
-    the gate passes through and the assembler proceeds to MODE E.
-    """
-
-    async def _run_async_impl(
-        self, ctx: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-        state = ctx.session.state
-
-        if state.get(MTG_OWNER_GATE_STATE) == "RESOLVED":
-            yield model_event(self.name, "Owner gate: RESOLVED — continuing to assembler.")
-            return
-
-        needs_card = False
-        verdict_data = state.get(MTG_GATE_VERDICT)
-        if verdict_data:
-            try:
-                verdict = GateVerdict.model_validate(verdict_data)
-                needs_card = any(
-                    c.id in ("owners_assigned", "due_dates_set") and not c.passed
-                    for c in verdict.checks
-                )
-            except Exception:
-                pass
-
-        if needs_card:
-            yield model_event(
-                self.name,
-                "Owner gate: PENDING — card form will be posted.",
-                **{MTG_OWNER_GATE_STATE: "PENDING"},
-            )
-        else:
-            yield model_event(
-                self.name, "Owner gate: all action items have owners — continuing."
-            )
+# ── Custom deterministic agents ─────────────────────────────────────────────
 
 
 class MeetingFanOutAgent(BaseAgent):
@@ -366,95 +375,93 @@ class CalendarCreatorAgent(BaseAgent):
         )
 
 
-def _notes_instruction(ctx: ReadonlyContext) -> str:
-    """Instruction provider: inline the patched ParsedMeeting for the notes LLM.
-
-    Injecting the JSON directly (rather than relying on conversation history)
-    guarantees the notes reflect card-form owner/due-date edits.
-    """
-    parsed = ctx.state.get(MTG_PARSED) or {}
-    parsed_json = json.dumps(parsed, indent=2, ensure_ascii=False)
-    return (
-        f"{_NOTES_WRITER_INSTRUCTION}\n\n"
-        "Parsed meeting data (authoritative):\n```json\n"
-        f"{parsed_json}\n```\n"
-    )
+# ── Component factories + registrations ─────────────────────────────────────
 
 
-# ── Pipeline factory ──────────────────────────────────────────────────────
+@registry.agent_factory("mtg.fan_out_compute")
+def _build_fan_out_compute(_user_email: str) -> MeetingFanOutAgent:
+    return MeetingFanOutAgent(name="meeting_fan_out_compute")
 
-async def _build(user_email: str) -> SequentialAgent:
-    cfg = settings()
 
-    _parser_llm = LlmAgent(
-        name="meeting_parser_llm",
-        model=gemini_model(),
-        instruction=_PARSER_INSTRUCTION_FRESH,
-        tools=[context_toolset(user_email)],
-        output_schema=ParsedMeeting,
-        output_key=MTG_PARSED,
-    )
-    parser = GuardAgent(
-        name="meeting_parser",
-        skip_when=_meeting_already_parsed,
-        skip_text="Meeting already parsed — using stored result.",
-        sub_agent=_parser_llm,
-        restore_key=MTG_PARSED,
-    )
+@registry.agent_factory("mtg.calendar_creator")
+def _build_calendar_creator(user_email: str) -> CalendarCreatorAgent:
+    return CalendarCreatorAgent(name="meeting_calendar_creator", user_email=user_email)
 
-    # Email drafts, calendar holds, and tracker rows are mechanical mappings
-    # over the parsed meeting — computed in Python so they always reflect the
-    # card-patched owners/due-dates. Only the notes prose stays an LLM, and it
-    # is fed the patched ParsedMeeting JSON explicitly via _notes_instruction.
-    fan_out_compute = MeetingFanOutAgent(name="meeting_fan_out_compute")
 
-    # Personal calendar reminders are created deterministically (not by the
-    # assembler LLM) so we capture a reliable action_item_id -> event_id map in
-    # state for the post-meeting invite dialog to patch.
-    calendar_creator = CalendarCreatorAgent(
-        name="meeting_calendar_creator",
-        user_email=user_email,
-    )
+registry.register_schema("ParsedMeeting", ParsedMeeting)
+registry.register_checks("mtg.gate", _MEETING_GATE_CHECKS)
 
-    notes_writer = LlmAgent(
-        name="notes_writer",
-        model=gemini_model(),
-        instruction=_notes_instruction,
-        output_key=MTG_NOTES_DOC,
-    )
 
-    _fan_out_seq = SequentialAgent(
-        name="meeting_fan_out",
-        sub_agents=[fan_out_compute, calendar_creator, notes_writer],
-    )
-    fan_out = GuardAgent(
-        name="meeting_conditional_fan_out",
-        skip_when=_owner_gate_pending,
-        skip_text="Owner gate pending — skipping fan-out.",
-        sub_agent=_fan_out_seq,
-    )
+# ── Spec ────────────────────────────────────────────────────────────────────
 
-    gate = GateAgent(
-        name="meeting_gate",
-        checks=_MEETING_GATE_CHECKS,
-        verdict_key=MTG_GATE_VERDICT,
-        failed_key=MTG_GATE_FAILED,
-    )
 
-    owner_gate = OwnerAssignmentGate(name="owner_assignment_gate")
+MEETING_SPEC = EngineSpec(
+    name="meeting_pipeline",
+    stages=[
+        LlmStageSpec(
+            name="meeting_parser_llm",
+            instruction_text=_PARSER_INSTRUCTION_FRESH,
+            toolsets=[ToolsetRef.CONTEXT],
+            output_schema="ParsedMeeting",
+            output_key=MTG_PARSED,
+            guard=GuardSpec(
+                skip_when="mtg.parsed",
+                skip_text="Meeting already parsed — using stored result.",
+                restore_key=MTG_PARSED,
+            ),
+        ),
+        GateStageSpec(
+            name="meeting_gate",
+            checks="mtg.gate",
+            verdict_key=MTG_GATE_VERDICT,
+            failed_key=MTG_GATE_FAILED,
+        ),
+        FormGateStageSpec(
+            name="owner_assignment_gate",
+            state_key=MTG_OWNER_GATE_STATE,
+            is_resolved="mtg.owner_resolved",
+            should_prompt="mtg.needs_owner_card",
+            pending_text="Owner gate: PENDING — card form will be posted.",
+            resolved_text="Owner gate: RESOLVED — continuing to assembler.",
+            skip_text="Owner gate: all action items have owners — continuing.",
+        ),
+        # Drafts/holds/rows are mechanical mappings over the parsed meeting —
+        # computed in Python so they always reflect card-patched owners/dates.
+        # Only the notes prose stays an LLM, fed the patched ParsedMeeting JSON
+        # explicitly via the mtg.notes provider. The whole group is skipped
+        # while the owner card is pending.
+        SequentialStageSpec(
+            name="meeting_fan_out",
+            guard=GuardSpec(
+                skip_when="mtg.owner_pending",
+                skip_text="Owner gate pending — skipping fan-out.",
+            ),
+            sub_stages=[
+                CustomStageSpec(
+                    name="meeting_fan_out_compute", factory="mtg.fan_out_compute"
+                ),
+                CustomStageSpec(
+                    name="meeting_calendar_creator", factory="mtg.calendar_creator"
+                ),
+                LlmStageSpec(
+                    name="notes_writer",
+                    instruction="mtg.notes",
+                    output_key=MTG_NOTES_DOC,
+                ),
+            ],
+        ),
+        LlmStageSpec(
+            name="meeting_assembler",
+            instruction_text=_ASSEMBLER_INSTRUCTION,
+            toolsets=[ToolsetRef.CONTEXT, ToolsetRef.ACTION],
+            output_key=MTG_ASSEMBLY_STATUS,
+        ),
+    ],
+)
 
-    assembler = LlmAgent(
-        name="meeting_assembler",
-        model=gemini_model(),
-        instruction=_ASSEMBLER_INSTRUCTION,
-        tools=[context_toolset(user_email), action_toolset()],
-        output_key=MTG_ASSEMBLY_STATUS,
-    )
 
-    return SequentialAgent(
-        name="meeting_pipeline",
-        sub_agents=[parser, gate, owner_gate, fan_out, assembler],
-    )
+async def _build(user_email: str):
+    return await build_engine(MEETING_SPEC, user_email)
 
 
 WORKFLOW = Workflow(

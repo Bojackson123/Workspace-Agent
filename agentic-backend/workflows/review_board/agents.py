@@ -1,37 +1,35 @@
-"""/review — Red-Team Review Board.
+"""/review — Red-Team Review Board (declared as an :class:`EngineSpec`).
 
 Pipeline:
   Sequential[
-    TemplateParser                                       (fetch + structure)
-    SectionDrafter                                       (draft from sources)
-    Loop(max=4)[ Critic → Author → LoopExitChecker ]    (adversarial loop)
-    ReviewGate                                           (pure Python)
-    ReviewAssembler                                      (write Workspace)
+    LlmStage(template_parser)                fetch + structure the template
+    LlmStage(section_drafter)                draft each section from sources
+    Loop(max=4)[ Critic -> Author -> exit ]  adversarial critic/author loop
+    Gate(review_gate)                        pure-Python completeness checks
+    LlmStage(assembler)                      write the filled Doc + ledger
   ]
 
 Invocation: /review <template-doc-url>
   Optionally: /review <template-doc-url> sources: <drive-folder-url>
 
-The user provides a template Google Doc. TemplateParser fetches it via the
-Context MCP and directly produces a structured FillContract (ADK 1.0 supports
-output_schema + tools together); SectionDrafter fills each section from source
-documents; the Critic attacks the draft; the Author defends and revises; the
-loop exits when no CRITICAL/MAJOR objections are open; the gate verifies
-completeness; the Assembler writes the filled Doc + objection ledger to the
-Shared Drive.
+The template parser produces a structured ``FillContract``; the section
+drafter fills each field from source documents; the Critic attacks the draft;
+the Author defends and revises; the loop exits when no CRITICAL/MAJOR
+objections are open; the gate verifies completeness; the Assembler writes the
+filled Doc + objection ledger to the Shared Drive.
+
+This module declares the spec and registers the engine-specific components
+(gate checks, loop-exit predicate, schemas) it references; the generic stage
+machinery lives in :mod:`engine`.
 """
 
 from __future__ import annotations
 
 import json
 
-from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
-
-from agent import action_toolset, context_toolset, gemini_model
 from workflows._base import AccessMode, Workflow
-from workflows.common.gate import GateAgent, GateCheck
+from workflows.common.gate import GateCheck
 from workflows.common.grounding import validate_grounding
-from workflows.common.loop_exit import LoopExitChecker
 from workflows.common.state_parse import coerce_model
 from workflows.common.state_keys import (
     RVW_FILL_CONTRACT,
@@ -39,6 +37,15 @@ from workflows.common.state_keys import (
     RVW_GATE_VERDICT,
     RVW_LEDGER,
     RVW_SECTIONS,
+)
+from engine import (
+    EngineSpec,
+    GateStageSpec,
+    LlmStageSpec,
+    LoopStageSpec,
+    ToolsetRef,
+    build_engine,
+    registry,
 )
 from workflows.review_board.schemas import (
     FilledSection,
@@ -368,6 +375,7 @@ _REVIEW_GATE_CHECKS = [
 
 # ── Loop exit predicate ───────────────────────────────────────────────────
 
+@registry.predicate("rvw.no_open_critical_major")
 def _no_open_critical_major(state: dict) -> bool:
     """Exit the loop when no CRITICAL or MAJOR objection is OPEN or DISPUTED."""
     ledger_data = state.get(RVW_LEDGER)
@@ -385,75 +393,72 @@ def _no_open_critical_major(state: dict) -> bool:
     )
 
 
-# ── Pipeline factory ──────────────────────────────────────────────────────
+# ── Registrations ───────────────────────────────────────────────────────────
 
-async def _build(user_email: str) -> SequentialAgent:
-    template_parser = LlmAgent(
-        name="template_parser",
-        model=gemini_model(),
-        instruction=_TEMPLATE_PARSER_INSTRUCTION,
-        tools=[context_toolset(user_email)],
-        output_schema=FillContract,
-        output_key=RVW_FILL_CONTRACT,
-    )
+registry.register_schema("FillContract", FillContract)
+registry.register_schema("ObjectionLedger", ObjectionLedger)
+registry.register_checks("rvw.gate", _REVIEW_GATE_CHECKS)
 
-    section_drafter = LlmAgent(
-        name="section_drafter",
-        model=gemini_model(),
-        instruction=_SECTION_DRAFTER_INSTRUCTION,
-        tools=[context_toolset(user_email)],
-        output_key=RVW_SECTIONS,
-    )
 
-    critic = LlmAgent(
-        name="critic",
-        model=gemini_model(),
-        instruction=_CRITIC_INSTRUCTION,
-        output_schema=ObjectionLedger,
-        output_key=RVW_LEDGER,
-    )
+# ── Spec ────────────────────────────────────────────────────────────────────
 
-    author = LlmAgent(
-        name="author",
-        model=gemini_model(),
-        instruction=_AUTHOR_INSTRUCTION,
-        tools=[context_toolset(user_email)],
-        # Author writes both sections and ledger updates; output_key writes
-        # the full response text which the next critic reads from conversation.
-        # Updated sections and ledger are embedded as JSON in the response
-        # and picked up by the critic's context.
-        output_key=RVW_SECTIONS,
-    )
 
-    loop_exit = LoopExitChecker(
-        name="review_loop_exit",
-        exit_predicate=_no_open_critical_major,
-    )
+REVIEW_SPEC = EngineSpec(
+    name="review_pipeline",
+    stages=[
+        LlmStageSpec(
+            name="template_parser",
+            instruction_text=_TEMPLATE_PARSER_INSTRUCTION,
+            toolsets=[ToolsetRef.CONTEXT],
+            output_schema="FillContract",
+            output_key=RVW_FILL_CONTRACT,
+        ),
+        LlmStageSpec(
+            name="section_drafter",
+            instruction_text=_SECTION_DRAFTER_INSTRUCTION,
+            toolsets=[ToolsetRef.CONTEXT],
+            output_key=RVW_SECTIONS,
+        ),
+        LoopStageSpec(
+            name="review_loop",
+            max_iterations=4,
+            exit_predicate="rvw.no_open_critical_major",
+            sub_stages=[
+                LlmStageSpec(
+                    name="critic",
+                    instruction_text=_CRITIC_INSTRUCTION,
+                    output_schema="ObjectionLedger",
+                    output_key=RVW_LEDGER,
+                ),
+                LlmStageSpec(
+                    name="author",
+                    instruction_text=_AUTHOR_INSTRUCTION,
+                    toolsets=[ToolsetRef.CONTEXT],
+                    # Author writes both sections and ledger updates; output_key
+                    # stores the full response text which the next critic reads
+                    # from conversation history (updated sections/ledger embedded
+                    # as JSON in the response).
+                    output_key=RVW_SECTIONS,
+                ),
+            ],
+        ),
+        GateStageSpec(
+            name="review_gate",
+            checks="rvw.gate",
+            verdict_key=RVW_GATE_VERDICT,
+            failed_key=RVW_GATE_FAILED,
+        ),
+        LlmStageSpec(
+            name="review_assembler",
+            instruction_text=_ASSEMBLER_INSTRUCTION,
+            toolsets=[ToolsetRef.ACTION],
+        ),
+    ],
+)
 
-    review_loop = LoopAgent(
-        name="review_loop",
-        sub_agents=[critic, author, loop_exit],
-        max_iterations=4,
-    )
 
-    gate = GateAgent(
-        name="review_gate",
-        checks=_REVIEW_GATE_CHECKS,
-        verdict_key=RVW_GATE_VERDICT,
-        failed_key=RVW_GATE_FAILED,
-    )
-
-    assembler = LlmAgent(
-        name="review_assembler",
-        model=gemini_model(),
-        instruction=_ASSEMBLER_INSTRUCTION,
-        tools=[action_toolset()],
-    )
-
-    return SequentialAgent(
-        name="review_pipeline",
-        sub_agents=[template_parser, section_drafter, review_loop, gate, assembler],
-    )
+async def _build(user_email: str):
+    return await build_engine(REVIEW_SPEC, user_email)
 
 
 WORKFLOW = Workflow(

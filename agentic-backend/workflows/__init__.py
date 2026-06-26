@@ -46,24 +46,18 @@ from workflows._default import DEFAULT_WORKFLOW
 from workflows._helpers import llm_workflow
 
 # ---- Per-command imports -------------------------------------------------
-from workflows.draft import WORKFLOW as _DRAFT_WORKFLOW
-from workflows.iq_engine import WORKFLOW as _IQ_WORKFLOW
+# Each engine declares its pipeline as an engine.EngineSpec and
+# exports a WORKFLOW whose build_agent compiles it per request.
 from workflows.meeting_engine import WORKFLOW as _MEETING_WORKFLOW
-from workflows.research import WORKFLOW as _RESEARCH_WORKFLOW
 from workflows.review_board import WORKFLOW as _REVIEW_WORKFLOW
 from workflows.rfi_engine import WORKFLOW as _RFI_WORKFLOW
-from workflows.sequential_report import WORKFLOW as _REPORT_WORKFLOW
 
 # Explicit dispatch list. Comment out an entry to temporarily disable a
 # workflow without removing its file.
 _REGISTERED: list[Workflow] = [
-    _RESEARCH_WORKFLOW,
-    _DRAFT_WORKFLOW,
-    _REPORT_WORKFLOW,
     _MEETING_WORKFLOW,
     _REVIEW_WORKFLOW,
     _RFI_WORKFLOW,
-    _IQ_WORKFLOW,
 ]
 
 

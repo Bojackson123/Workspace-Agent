@@ -7,8 +7,11 @@ items are missing owners or due dates.
 
 The implementation is a `SequentialAgent` (`workflows/meeting_engine/agents.py`)
 whose stages mix pure-Python `BaseAgent`s (deterministic, idempotent) with two
-`LlmAgent`s (the transcript parse and the notes prose). The card suspend/resume
-plumbing lives in `chat.py`.
+`LlmAgent`s (the transcript parse and the notes prose). It's declared as an
+`EngineSpec` and compiled by `engine.build_engine` (see
+[`Workflow-Engine.md`](./Workflow-Engine.md) §4b); the owner gate is the shared
+`FormGate` primitive. The card suspend/resume plumbing lives in
+`chat/cards/meeting.py`.
 
 > **Why so much is deterministic.** After the owner-assignment card patches
 > owners/due-dates into `MTG_PARSED`, the email/calendar/tracker artefacts are
@@ -23,10 +26,10 @@ plumbing lives in `chat.py`.
 
 ```mermaid
 flowchart LR
-    P["meeting_pipeline (SequentialAgent)"] --> A["parser<br/>ConditionalParserAgent"]
+    P["meeting_pipeline (SequentialAgent)"] --> A["parser<br/>GuardAgent → LlmAgent"]
     A --> B["gate<br/>GateAgent (pure Python)"]
-    B --> C["owner_gate<br/>OwnerAssignmentGate"]
-    C --> D["fan_out<br/>ConditionalFanOutAgent"]
+    B --> C["owner_gate<br/>FormGate"]
+    C --> D["fan_out<br/>GuardAgent → Sequential"]
     D --> E["assembler<br/>LlmAgent"]
 ```
 
@@ -48,7 +51,7 @@ flowchart TD
     HARD -->|"no"| OWN{"any item missing owner or due date?"}
 
     OWN -->|"yes"| PEND["owner_gate then PENDING<br/>fan-out skipped<br/>assembler MODE 0: 'form sent'"]
-    PEND --> CARD["chat.py posts owner-assignment card"]
+    PEND --> CARD["chat/cards/meeting.py posts owner-assignment card"]
     CARD --> SUBMIT["user submits card (CARD_CLICKED)"]
     SUBMIT --> PATCH["patch MTG_PARSED owners/dates<br/>MTG_OWNER_GATE_STATE = RESOLVED<br/>clear stale fan-out keys"]
     PATCH --> RERUN["re-run pipeline"]
@@ -61,7 +64,7 @@ flowchart TD
 
 ---
 
-## 3. Stage 1 — parser (`ConditionalParserAgent`)
+## 3. Stage 1 — parser (`GuardAgent` → `LlmAgent`)
 
 A pure-Python guard wrapping the parsing `LlmAgent`. On a re-run the parsed
 value already exists (patched by the card handler), so it is re-emitted
@@ -70,7 +73,7 @@ stale null-owner parse from history.
 
 ```mermaid
 flowchart TD
-    PA["ConditionalParserAgent"] --> Q{"MTG_PARSED already in state?"}
+    PA["parser GuardAgent"] --> Q{"MTG_PARSED already in state?"}
     Q -->|"yes (re-run)"| RE["re-emit stored ParsedMeeting via state_delta — no LLM"]
     Q -->|"no (first run)"| LLM["meeting_parser_llm:<br/>read_my_document(doc id from URL)<br/>then structured ParsedMeeting<br/>then MTG_PARSED"]
 ```
@@ -108,21 +111,21 @@ flowchart TD
 
 ## 5. Stage 3 — owner gate + suspend/resume
 
-This is the human-in-the-loop heart of the workflow. `OwnerAssignmentGate`
-can't stop the `SequentialAgent`, so it sets `MTG_OWNER_GATE_STATE = PENDING`
-and relies on `ConditionalFanOutAgent` to skip the fan-out and the assembler's
-MODE 0 to emit the "form sent" message.
+This is the human-in-the-loop heart of the workflow. The owner gate (a
+`FormGate`) can't stop the `SequentialAgent`, so it sets
+`MTG_OWNER_GATE_STATE = PENDING` and relies on the fan-out's `GuardAgent` to
+skip the fan-out and the assembler's MODE 0 to emit the "form sent" message.
 
 ### 5a. The gate decision
 
 ```mermaid
 flowchart TD
-    OG["OwnerAssignmentGate"] --> S{"MTG_OWNER_GATE_STATE"}
+    OG["owner_assignment_gate<br/>(FormGate)"] --> S{"MTG_OWNER_GATE_STATE"}
     S -->|"RESOLVED (card already submitted)"| PASS["passthrough then continue to fan-out"]
     S -->|"unset (first pass)"| CK{"owners_assigned OR due_dates_set failed in verdict?"}
     CK -->|"no"| PASS
     CK -->|"yes"| PEND["set MTG_OWNER_GATE_STATE = PENDING"]
-    PEND --> SKIP["ConditionalFanOutAgent skips the fan-out sequence"]
+    PEND --> SKIP["fan-out GuardAgent skips the fan-out sequence"]
     SKIP --> ASM0["assembler MODE 0: 'An owner assignment form has been sent...'"]
 ```
 
@@ -159,7 +162,7 @@ State keys touched across the suspend/resume boundary:
 
 ---
 
-## 6. Stage 4 — fan-out (`ConditionalFanOutAgent`)
+## 6. Stage 4 — fan-out (`GuardAgent` → `SequentialAgent`)
 
 Skipped entirely while the owner gate is `PENDING`. Otherwise it runs a small
 `SequentialAgent`: deterministic compute then deterministic calendar creation
@@ -167,7 +170,7 @@ then LLM notes prose.
 
 ```mermaid
 flowchart TD
-    FO["ConditionalFanOutAgent"] --> Q{"MTG_OWNER_GATE_STATE == PENDING?"}
+    FO["fan-out GuardAgent"] --> Q{"MTG_OWNER_GATE_STATE == PENDING?"}
     Q -->|"yes"| SK["skip — yield notice (lets card flow proceed)"]
     Q -->|"no"| SEQ["meeting_fan_out (SequentialAgent)"]
 
@@ -248,4 +251,5 @@ flowchart TD
 - [`Architecture.md`](./Architecture.md) — system architecture and the
   dual-MCP security model the artefact writes depend on.
 - Source: `agentic-backend/workflows/meeting_engine/agents.py` (pipeline),
-  `schemas.py` (data shapes), and the card handlers in `agentic-backend/chat.py`.
+  `schemas.py` (data shapes), and the card handlers in
+  `agentic-backend/chat/cards/meeting.py`.

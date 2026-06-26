@@ -42,13 +42,3 @@ RFI_ASSEMBLY_STATUS = "rfi_assembly_status"  # contains RFI_COMPLETED_MARKER whe
 # Marker stored inside RFI_ASSEMBLY_STATUS once the response file is written.
 # Shared by the assembler (writer) and chat.py (resume guard) so they can't drift.
 RFI_COMPLETED_MARKER = "<<STATUS:COMPLETED>>"
-
-# ── Customer IQ Engine ─────────────────────────────────────────────────────
-IQ_COMPANY_NAME = "iq_company_name"      # company name parsed from the /iq prompt
-IQ_RESEARCH = "iq_research"              # free-form grounded research brief (stage 1)
-IQ_PROFILE = "iq_profile"                # CustomerIQReport dict from the structuring agent (stage 2)
-IQ_FILLED_LINK = "iq_filled_link"        # webViewLink of the filled dossier doc
-IQ_ASSEMBLY_STATUS = "iq_assembly_status"  # contains "<<STATUS:COMPLETED>>" when done
-IQ_TAILOR = "iq_tailor"                  # dict of the tailoring levers from the form
-IQ_TAILOR_STATE = "iq_tailor_state"      # "PENDING" | "RESOLVED"
-IQ_TAILOR_CARD_MSG = "iq_tailor_card_msg"  # Chat message.name of the tailoring card

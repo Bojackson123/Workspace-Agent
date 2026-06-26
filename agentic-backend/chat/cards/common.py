@@ -17,13 +17,9 @@ from chat.stores import _session_store
 
 log = logging.getLogger(__name__)
 
-# Command id of the RFI workflow — the slash runner uses this to branch
-# into the attachment-intake + form-posting path.
+# Command id of the RFI workflow — keys its attachment-intake + form-posting
+# hooks in the card dispatch registry.
 _RFI_COMMAND_ID: Final = 6
-
-# Command id of the Customer IQ workflow — branches the runner into the
-# tailoring-form path (post the form first, then run on submit).
-_IQ_COMMAND_ID: Final = 7
 
 
 def _confirmation_card_body(text: str) -> dict:

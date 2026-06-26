@@ -13,7 +13,7 @@ from __future__ import annotations
 from google.adk.agents import LlmAgent
 from google.adk.tools.mcp_tool import MCPToolset
 
-from agent import action_toolset, build_llm_agent, context_toolset
+from clients.agent import action_toolset, build_llm_agent, context_toolset
 from workflows._base import AccessMode, ToolsetKind, Workflow
 
 

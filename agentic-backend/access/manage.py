@@ -29,7 +29,7 @@ import argparse
 import asyncio
 import sys
 
-from access_store import AccessStore, VALID_RULE_TYPES
+from access.store import AccessStore, VALID_RULE_TYPES
 from sessions import SessionStore
 from workflows import WORKFLOWS, Workflow, get_workflow, get_workflow_by_name
 

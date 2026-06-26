@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 from typing import Final
 
-from access import authorize_bootstrap_admin
-from access_store import VALID_RULE_TYPES
+from access.policy import authorize_bootstrap_admin
+from access.store import VALID_RULE_TYPES
 from chat.events import ChatEvent
 from chat.formatting import chat_text
 from chat.stores import _access_store, _session_store

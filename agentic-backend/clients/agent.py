@@ -25,6 +25,7 @@ a cycle.
 from __future__ import annotations
 
 from functools import cache
+from typing import TYPE_CHECKING
 
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.models import Gemini
@@ -32,7 +33,12 @@ from google.adk.tools.mcp_tool import MCPToolset, StreamableHTTPConnectionParams
 from google.genai import types
 
 from config import settings
-from workflows._base import Workflow
+
+if TYPE_CHECKING:
+    # Type-only import: avoids the clients.agent ↔ workflows import cycle
+    # (workflows/_helpers imports this module at runtime). Annotations are
+    # strings under `from __future__ import annotations`, so this suffices.
+    from workflows._base import Workflow
 
 AGENT_DESCRIPTION = (
     "A Google Workspace assistant that reads user context via a "

@@ -40,7 +40,7 @@ load_dotenv()
 # workflows._base finds a fully-initialised package in sys.modules.
 import workflows  # noqa: E402 — must come before agent
 
-import agent as _agent_mod  # noqa: E402 — safe now that workflows is loaded
+import clients.agent as _agent_mod  # noqa: E402 — safe now that workflows is loaded
 
 # ── Build the workflow agent ───────────────────────────────────────────────
 _user_email = os.environ.get("DEV_USER_EMAIL")

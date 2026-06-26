@@ -21,7 +21,7 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools.google_search_tool import GoogleSearchTool
 from google.genai import types
 
-from agent import action_toolset, gemini_model
+from clients.agent import action_toolset, gemini_model
 from config import settings
 from workflows.common.events import model_event
 from workflows.common.retry import retry_async

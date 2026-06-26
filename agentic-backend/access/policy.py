@@ -37,7 +37,7 @@ from config import settings
 from workflows import AccessMode
 
 if TYPE_CHECKING:
-    from access_store import AccessStore
+    from access.store import AccessStore
 
 log = logging.getLogger(__name__)
 

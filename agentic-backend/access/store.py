@@ -131,7 +131,7 @@ class AccessStore:
         is responsible for applying the workflow's :class:`AccessMode`
         default to decide allow vs. deny.
         """
-        from access import AccessPolicy  # local import: avoid module cycle
+        from access.policy import AccessPolicy  # local import: avoid module cycle
 
         now = time.time()
         cached = self._cache.get(command_id)

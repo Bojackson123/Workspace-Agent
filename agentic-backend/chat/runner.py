@@ -18,11 +18,11 @@ from google.adk.runners import Runner
 from google.genai import types
 from opentelemetry import trace as otel_trace
 
-from access_store import AccessStore
-from agent import build_agent_for_workflow
+from access.store import AccessStore
+from clients.agent import build_agent_for_workflow
 from chat.formatting import _markdown_to_chat
 from chat.stores import _access_store, _session_store
-from chat_client import post_message_to_space
+from chat.client import post_message_to_space
 from config import settings
 from workflows import DEFAULT_WORKFLOW, Workflow, get_workflow
 from workflows.common.state_keys import (

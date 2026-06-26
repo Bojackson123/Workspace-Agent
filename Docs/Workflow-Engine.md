@@ -132,8 +132,8 @@ flowchart LR
     DISP["dispatcher (chat.py)"] -->|"get_workflow(command_id)"| DICT
     DICT --> WF["Workflow dataclass<br/>command_id · command_name · description<br/>default_access · build_agent · ack_message"]
     WF -->|"await build_agent(user_email)"| SHAPE{"agent shape (workflow's choice)"}
-    SHAPE --> A1["single LlmAgent<br/>(via llm_workflow helper)"]
-    SHAPE --> A2["SequentialAgent<br/>(e.g. /report, /meeting)"]
+    SHAPE --> A1["single LlmAgent<br/>(via llm_workflow helper — the &lt;default&gt; workflow)"]
+    SHAPE --> A2["SequentialAgent compiled from an EngineSpec<br/>(/meeting · /review · /rfi)"]
     SHAPE --> A3["custom BaseAgent subclass"]
 
     WF -.->|"declares toolsets"| T1["Context MCP<br/>(read-only, DWD-impersonated)"]
@@ -142,6 +142,43 @@ flowchart LR
 
 A workflow scoped to one toolset is *structurally* incapable of using the
 other — the unused MCP is never attached to the agent.
+
+---
+
+## 4b. Composable engine (`EngineSpec`)
+
+The three multi-stage workflows aren't hand-wired — each is declared as an
+`EngineSpec` (`engine/spec.py`): an ordered list of typed stage specs.
+`build_engine(spec, user_email)` (`compiler.py`) compiles it into the
+`SequentialAgent` the dispatcher runs. Stages name their code dependencies by
+string key into `engine/registry.py`, so the structure + prompts read
+as data while schemas, gate checks, predicates, instruction providers and
+bespoke agents stay in code.
+
+```mermaid
+flowchart LR
+    SPEC["EngineSpec<br/>(ordered stage specs)"] --> CMP["build_engine(spec, user_email)"]
+    CMP --> SEQ["SequentialAgent"]
+
+    subgraph kinds["stage kinds → compiled agent"]
+      direction TB
+      K1["LlmStageSpec → LlmAgent<br/>(optionally GuardAgent-wrapped)"]
+      K2["GateStageSpec → GateAgent"]
+      K3["FormGateStageSpec → FormGate<br/>(suspend/resume)"]
+      K4["SequentialStageSpec → nested SequentialAgent"]
+      K5["LoopStageSpec → LoopAgent + LoopExitChecker"]
+      K6["CustomStageSpec → registered BaseAgent factory"]
+    end
+
+    CMP -.-> kinds
+    REG["registry.py<br/>schemas · checks · predicates · instructions · agents"] -.->|"resolved by key"| CMP
+```
+
+Two reusable primitives live alongside the compiler: `FormGate` (the
+generalised suspend/resume gate that replaced the per-engine guidance/gap/owner
+gates) and `IdempotentAssembler` (the completed-marker-guarded deterministic
+writer). Adding a workflow = write a spec + register any new component; adding a
+*capability* the framework lacks = one new stage class, reused thereafter.
 
 ---
 
@@ -197,8 +234,8 @@ flowchart TD
 ```
 
 Because a slash command always deletes and recreates the session, workflow
-boundaries reset conversation history: `/draft`'s prompt never inherits
-`/research`'s tool-call history. `/exit` simply deletes the thread's session.
+boundaries reset conversation history: `/review`'s prompt never inherits
+`/meeting`'s tool-call history. `/exit` simply deletes the thread's session.
 
 ---
 

@@ -81,7 +81,7 @@ class Workflow:
         command_id: Numeric ID assigned in the Chat API console (1–1000).
             Used as the primary lookup key by the dispatcher.
         command_name: The slash command as the user types it
-            (e.g. ``"/draft"``). Used for logs, ``/help``, and the
+            (e.g. ``"/meeting"``). Used for logs, ``/help``, and the
             ``/grant`` parser.
         description: One-line summary surfaced in ``/help`` listings.
         default_access: Empty-table behaviour. ``OPEN`` for general

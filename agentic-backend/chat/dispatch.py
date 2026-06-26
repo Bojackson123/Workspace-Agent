@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import BackgroundTasks
 
-from access import authorize
+from access.policy import authorize
 from chat.cards import handle_card_clicked
 from chat.events import (
     EVENT_ADDED_TO_SPACE,

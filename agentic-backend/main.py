@@ -10,8 +10,8 @@ import os
 # Logging and tracing must be configured before importing any application
 # module so that module-level loggers and the OTel tracer provider are both
 # ready by the time chat.py / sessions.py pull them in.
-from logging_setup import configure_logging  # noqa: E402
-from tracing_setup import configure_tracing  # noqa: E402
+from observability.logging_setup import configure_logging  # noqa: E402
+from observability.tracing_setup import configure_tracing  # noqa: E402
 
 configure_logging()
 configure_tracing()
@@ -36,7 +36,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Request  # noqa: E402
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor  # noqa: E402
 
 from chat import handle_event  # noqa: E402
-from security import verify_chat_jwt  # noqa: E402
+from chat.security import verify_chat_jwt  # noqa: E402
 
 app = FastAPI(title="Dual-MCP Agent Backend")
 FastAPIInstrumentor.instrument_app(app)

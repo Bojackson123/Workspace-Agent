@@ -17,14 +17,19 @@ from typing import Any, Final
 from fastapi import BackgroundTasks
 
 from chat import runner
-from chat.cards.common import _append_state, _confirmation_card_body, _form_text
-from chat.cards.registry import register_card
+from chat.cards.common import (
+    _RFI_COMMAND_ID,
+    _append_state,
+    _confirmation_card_body,
+    _form_text,
+)
+from chat.cards.registry import register_card, register_post, register_prepare
 from chat.events import Attachment, CardClickedEvent
 from chat.formatting import _markdown_to_chat
 from chat.stores import _session_store
-from chat_client import download_attachment, post_card_to_space, post_message_to_space
+from chat.client import download_attachment, post_card_to_space, post_message_to_space
 from config import settings
-from mcp_client import call_action_tool
+from clients.mcp_client import call_action_tool
 from sessions import STATE_ACTIVE_WORKFLOW_ID, _session_id_for
 from workflows import Workflow
 from workflows.common.state_keys import (
@@ -70,8 +75,9 @@ def _guess_mime(name: str) -> str:
     return _DOCX_MIME if name.lower().endswith(".docx") else _XLSX_MIME
 
 
+@register_prepare(_RFI_COMMAND_ID)
 async def prepare_rfi_file(
-    *, attachments: tuple[Attachment, ...], session: Any
+    *, attachments: tuple[Attachment, ...], session: Any, prompt: str = ""
 ) -> str | None:
     """Download the attached RFI, store it on the Shared Drive, seed state.
 
@@ -216,6 +222,7 @@ def _rfi_gap_items(state: dict) -> list[tuple[str, str]]:
     return items
 
 
+@register_post(_RFI_COMMAND_ID)
 async def post_rfi_result(
     *,
     space_resource: str,

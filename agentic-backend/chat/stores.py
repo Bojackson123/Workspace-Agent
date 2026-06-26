@@ -10,7 +10,7 @@ Keeping the singletons in their own leaf module lets every part of the
 
 from __future__ import annotations
 
-from access_store import AccessStore
+from access.store import AccessStore
 from sessions import SessionStore
 
 _session_store = SessionStore.from_settings()
