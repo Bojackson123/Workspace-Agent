@@ -1,4 +1,4 @@
-# Sanmina Agentic PoC — Dual-MCP Google Workspace Agent
+#  Acme Agentic PoC — Dual-MCP Google Workspace Agent
 
 An enterprise Google Chat assistant that reads a user's Workspace context
 (Gmail, Drive, Docs, Chat history) and produces outputs (Docs, Sheets,
@@ -220,9 +220,9 @@ commands restricted to bootstrap admins (set `BOOTSTRAP_ADMIN_EMAILS`
 as a comma-separated list):
 
 ```
-/grant /audit email:alice@sanmina.com
-/grant /audit domain:sanmina.com
-/revoke /audit email:alice@sanmina.com
+/grant /audit email:alice@ Acme.com
+/grant /audit domain: Acme.com
+/revoke /audit email:alice@ Acme.com
 /list-access /audit
 ```
 
