@@ -1,4 +1,4 @@
-#  Acme Agentic PoC — Dual-MCP Google Workspace Agent
+#  Workspace Agent — Dual-MCP Enterprise Assistant
 
 An enterprise Google Chat assistant that reads a user's Workspace context
 (Gmail, Drive, Docs, Chat history) and produces outputs (Docs, Sheets,
